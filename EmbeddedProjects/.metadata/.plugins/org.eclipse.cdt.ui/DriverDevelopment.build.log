@@ -1,0 +1,22 @@
+17:52:20 **** Incremental Build of configuration Debug for project DriverDevelopment ****
+make -j8 all 
+arm-none-eabi-gcc "../Src/main.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Src/main.d" -MT"Src/main.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Src/main.o"
+arm-none-eabi-gcc "../MyDriversErdem/Src/EXTI.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"MyDriversErdem/Src/EXTI.d" -MT"MyDriversErdem/Src/EXTI.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "MyDriversErdem/Src/EXTI.o"
+arm-none-eabi-gcc "../MyDriversErdem/Src/GPIO.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"MyDriversErdem/Src/GPIO.d" -MT"MyDriversErdem/Src/GPIO.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "MyDriversErdem/Src/GPIO.o"
+arm-none-eabi-gcc "../MyDriversErdem/Src/RCC.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"MyDriversErdem/Src/RCC.d" -MT"MyDriversErdem/Src/RCC.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "MyDriversErdem/Src/RCC.o"
+arm-none-eabi-gcc "../MyDriversErdem/Src/SPI.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"MyDriversErdem/Src/SPI.d" -MT"MyDriversErdem/Src/SPI.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "MyDriversErdem/Src/SPI.o"
+arm-none-eabi-gcc "../MyDriversErdem/Src/USART.c" -mcpu=cortex-m4 -std=gnu11 -g3 -DDEBUG -DSTM32 -DSTM32F407G_DISC1 -DSTM32F4 -DSTM32F407VGTx -c -I../Inc -I"C:/Users/LENOVO/Desktop/embedded/EmbeddedProjects/DriverDevelopment/MyDriversErdem/Inc" -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"MyDriversErdem/Src/USART.d" -MT"MyDriversErdem/Src/USART.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "MyDriversErdem/Src/USART.o"
+arm-none-eabi-gcc -o "DriverDevelopment.elf" @"objects.list"   -mcpu=cortex-m4 -T"C:\Users\LENOVO\Desktop\embedded\EmbeddedProjects\DriverDevelopment\STM32F407VGTX_FLASH.ld" --specs=nosys.specs -Wl,-Map="DriverDevelopment.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: DriverDevelopment.elf
+ 
+arm-none-eabi-size   DriverDevelopment.elf 
+arm-none-eabi-objdump -h -S  DriverDevelopment.elf  > "DriverDevelopment.list"
+   text	   data	    bss	    dec	    hex	filename
+   2236	      8	   1632	   3876	    f24	DriverDevelopment.elf
+Finished building: default.size.stdout
+ 
+Finished building: DriverDevelopment.list
+ 
+
+17:52:21 Build Finished. 0 errors, 0 warnings. (took 1s.178ms)
+

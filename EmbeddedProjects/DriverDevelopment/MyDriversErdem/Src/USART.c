@@ -1,0 +1,42 @@
+#include "USART.h"
+
+void USART_Init(USART_HandleTypedef_t *USART_Handle)
+{
+	/************************************************************************/
+	uint32_t tempReg = 0;
+
+	tempReg = USART_Handle->Instance->CR1;
+
+	tempReg |= (USART_Handle->Init.OverSampling) | (USART_Handle->Init.WordLength) | (USART_Handle->Init.Mode) | \
+			   (USART_Handle->Init.Parity);
+	USART_Handle->Instance->CR1 = tempReg;
+
+	/************************************************************************/
+
+
+	tempReg = USART_Handle->Instance->CR2;
+
+	tempReg |= ~(0x3U << UART_CR2_STOP);
+
+	tempReg |= (USART_Handle->Init.StopBits);
+
+	USART_Handle->Instance->CR2 = tempReg;
+
+	/************************************************************************/
+
+	tempReg = USART_Handle->Instance->CR3;
+
+	tempReg |= (USART_Handle->Init.HardWareFlowControl);
+
+	USART_Handle->Instance->CR3 = tempReg;
+}
+
+void USART_TransmitData(USART_InitTypedef_t *USART_Handle, uint8_t *pData, uint16_t datasize)
+{
+
+
+
+
+}
+
+

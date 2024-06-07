@@ -1,0 +1,29 @@
+
+
+#ifndef INC_USART_H_
+#define INC_USART_H_
+
+#include "stm32f407xx.h"
+
+typedef struct
+{
+
+	uint32_t OverSampling;
+	uint32_t BaudRate;
+	uint32_t WordLength;
+	uint32_t Parity;
+	uint32_t StopBits;
+	uint32_t HardWareFlowControl;
+	uint32_t Mode;
+
+}USART_InitTypedef_t;
+
+typedef struct
+{
+	USART_Typedef_t *Instance;
+	USART_InitTypedef_t Init;
+
+}USART_HandleTypedef_t;
+
+
+#endif /* INC_USART_H_ */

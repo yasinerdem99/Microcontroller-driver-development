@@ -1,0 +1,14 @@
+SPI.c:13:13:SPI_CloseISR_TX	1
+SPI.c:29:13:SPI_CloseISR_RX	1
+SPI.c:45:13:SPI_TransmitHelper_16Bits	2
+SPI.c:65:13:SPI_TransmitHelper_8Bits	2
+SPI.c:85:13:SPI_ReceiveHelper_8Bits	2
+SPI.c:104:13:SPI_ReceiveHelper_16Bits	2
+SPI.c:124:6:SPI_Init	1
+SPI.c:147:6:SPI_PeriphCmd	2
+SPI.c:175:6:SPI_TransmitData	7
+SPI.c:219:6:SPI_TransmitData_IT	3
+SPI.c:255:6:SPI_ReceiveData_IT	3
+SPI.c:293:6:SPI_InterruptHandler	5
+SPI.c:329:6:SPI_ReceiveData	6
+SPI.c:373:18:SPI_GetFlagStatus	1

@@ -1,0 +1,14 @@
+../MyDriversErdem/Src/SPI.c:13:13:SPI_CloseISR_TX	16	static
+../MyDriversErdem/Src/SPI.c:29:13:SPI_CloseISR_RX	16	static
+../MyDriversErdem/Src/SPI.c:45:13:SPI_TransmitHelper_16Bits	16	static
+../MyDriversErdem/Src/SPI.c:65:13:SPI_TransmitHelper_8Bits	16	static
+../MyDriversErdem/Src/SPI.c:85:13:SPI_ReceiveHelper_8Bits	16	static
+../MyDriversErdem/Src/SPI.c:104:13:SPI_ReceiveHelper_16Bits	16	static
+../MyDriversErdem/Src/SPI.c:124:6:SPI_Init	24	static
+../MyDriversErdem/Src/SPI.c:147:6:SPI_PeriphCmd	16	static
+../MyDriversErdem/Src/SPI.c:175:6:SPI_TransmitData	24	static
+../MyDriversErdem/Src/SPI.c:219:6:SPI_TransmitData_IT	32	static
+../MyDriversErdem/Src/SPI.c:255:6:SPI_ReceiveData_IT	32	static
+../MyDriversErdem/Src/SPI.c:293:6:SPI_InterruptHandler	24	static
+../MyDriversErdem/Src/SPI.c:329:6:SPI_ReceiveData	24	static
+../MyDriversErdem/Src/SPI.c:373:18:SPI_GetFlagStatus	16	static

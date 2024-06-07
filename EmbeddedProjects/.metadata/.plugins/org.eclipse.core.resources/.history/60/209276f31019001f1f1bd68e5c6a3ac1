@@ -1,0 +1,60 @@
+
+
+#ifndef INC_USART_H_
+#define INC_USART_H_
+
+#include "stm32f407xx.h"
+
+/*
+ *
+ * @def_group MODE_Types
+ *
+ */
+
+#define USART_MODE_Tx			( (uint32_t)(0x00000008) )
+#define USART_MODE_Rx			( (uint32_t)(0x00000004) )
+#define USART_MODE_Tx_Rx		( (uint32_t)(0x0000000C) )
+
+/*
+ *
+ * @def_group WordLength_Types
+ *
+ */
+
+#define USART_WORDLENGTH_8Bits	( (uint32_t)(0x00000000) )
+#define USART_WORDLENGTH_9Bits	( (uint32_t)(0x00001000) )
+
+/*
+ *
+ * @def_group Parity_Types
+ *
+ */
+
+#define USART_PARITY_NONE		( (uint32_t)(0x00000000) )
+#define USART_PARITY_Even		( (uint32_t)(0x00000400) )
+#define USART_PARITY_Odd		( (uint32_t)(0x00000600) )
+
+
+
+typedef struct
+{
+	uint32_t Mode; 						/*<! Transmission Reception modes @def_group MODE_Types	 */
+	uint32_t OverSampling;
+	uint32_t WordLength;				/*<! 8 Bits & 9 Bits modes @def_group WordLength_Types	 */
+	uint32_t Parity;					/*<! Even & Odd Parity modes @def_group Parity_Types	 */
+	uint32_t BaudRate;
+	uint32_t StopBits;
+	uint32_t HardWareFlowControl;
+
+
+}USART_InitTypedef_t;
+
+typedef struct
+{
+	USART_Typedef_t *Instance;
+	USART_InitTypedef_t Init;
+
+}USART_HandleTypedef_t;
+
+
+#endif /* INC_USART_H_ */
