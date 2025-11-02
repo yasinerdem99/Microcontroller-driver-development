@@ -1,0 +1,577 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>731</width>
+    <height>655</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>MainWindow</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <widget class="QGroupBox" name="groupBox">
+    <property name="geometry">
+     <rect>
+      <x>0</x>
+      <y>0</y>
+      <width>281</width>
+      <height>121</height>
+     </rect>
+    </property>
+    <property name="title">
+     <string>Bağlantı Ayarları</string>
+    </property>
+    <widget class="QComboBox" name="comboBox">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>20</y>
+       <width>131</width>
+       <height>41</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QComboBox" name="baudRateComboBox">
+     <property name="geometry">
+      <rect>
+       <x>0</x>
+       <y>70</y>
+       <width>131</width>
+       <height>41</height>
+      </rect>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="baglanButton">
+     <property name="geometry">
+      <rect>
+       <x>150</x>
+       <y>20</y>
+       <width>91</width>
+       <height>41</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Bağlantı Kur</string>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="baglantiKesButton">
+     <property name="geometry">
+      <rect>
+       <x>150</x>
+       <y>70</y>
+       <width>91</width>
+       <height>41</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Bağlantı Kes</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QGroupBox" name="groupBox_2">
+    <property name="geometry">
+     <rect>
+      <x>0</x>
+      <y>130</y>
+      <width>281</width>
+      <height>181</height>
+     </rect>
+    </property>
+    <property name="title">
+     <string>Kanal ve Akım Ayarı</string>
+    </property>
+    <widget class="QSpinBox" name="spinBox">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>30</y>
+       <width>71</width>
+       <height>41</height>
+      </rect>
+     </property>
+     <property name="maximum">
+      <number>6</number>
+     </property>
+    </widget>
+    <widget class="QDoubleSpinBox" name="doubleSpinBox">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>80</y>
+       <width>71</width>
+       <height>51</height>
+      </rect>
+     </property>
+     <property name="minimum">
+      <double>-20.000000000000000</double>
+     </property>
+     <property name="maximum">
+      <double>20.000000000000000</double>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="gonderButton">
+     <property name="geometry">
+      <rect>
+       <x>90</x>
+       <y>50</y>
+       <width>141</width>
+       <height>71</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>GONDER</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QGroupBox" name="groupBox_3">
+    <property name="geometry">
+     <rect>
+      <x>280</x>
+      <y>0</y>
+      <width>441</width>
+      <height>241</height>
+     </rect>
+    </property>
+    <property name="title">
+     <string>Terminal Ekranı</string>
+    </property>
+    <widget class="QTextBrowser" name="logTerminal">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>20</y>
+       <width>421</width>
+       <height>171</height>
+      </rect>
+     </property>
+     <property name="layoutDirection">
+      <enum>Qt::LayoutDirection::LeftToRight</enum>
+     </property>
+    </widget>
+    <widget class="QPushButton" name="temizleButton">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>190</y>
+       <width>111</width>
+       <height>41</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Temizle</string>
+     </property>
+    </widget>
+   </widget>
+   <widget class="QGroupBox" name="groupBox_4">
+    <property name="geometry">
+     <rect>
+      <x>280</x>
+      <y>240</y>
+      <width>441</width>
+      <height>71</height>
+     </rect>
+    </property>
+    <property name="title">
+     <string>Bağlantı Bilgileri</string>
+    </property>
+    <widget class="QLabel" name="statusLabel">
+     <property name="geometry">
+      <rect>
+       <x>10</x>
+       <y>30</y>
+       <width>261</width>
+       <height>31</height>
+      </rect>
+     </property>
+     <property name="text">
+      <string>Durum : Bağlı Değil&quot;</string>
+     </property>
+    </widget>
+   </widget>
+  </widget>
+  <widget class="QMenuBar" name="menubar">
+   <property name="geometry">
+    <rect>
+     <x>0</x>
+     <y>0</y>
+     <width>731</width>
+     <height>22</height>
+    </rect>
+   </property>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <resources/>
+ <connections/>
+</ui>
+...........................................................
+
+#ifndef MAINWINDOW_H
+#define MAINWINDOW_H
+
+#include <QMainWindow>
+#include <QSerialPort>
+
+QT_BEGIN_NAMESPACE
+namespace Ui { class MainWindow; }
+QT_END_NAMESPACE
+
+class MainWindow : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    MainWindow(QWidget *parent = nullptr);
+    ~MainWindow();
+
+private slots:
+    // .ui dosyasındaki bileşenlerin 'objectName'lerine göre
+    // Qt tarafından otomatik bağlanan slotlar
+    void on_baglanButton_clicked();
+    void on_baglantiKesButton_clicked();
+    void on_gonderButton_clicked();
+    void on_temizleButton_clicked();
+
+    // Serial porttan veri gelince manuel bağladığımız slot
+    void on_serial_readyRead();
+
+private:
+    Ui::MainWindow *ui;
+    QSerialPort *serial;
+
+    // Koyu modu uygulamak için yardımcı fonksiyon
+    void applyStyleSheet();
+};
+#endif // MAINWINDOW_H
+
+.............................................
+
+#include "mainwindow.h"
+#include "ui_mainwindow.h"  // Tasarım dosyasını dahil et
+#include <QSerialPortInfo> // COM portları bulmak için
+#include <QDebug>          // Hata ayıklama için
+
+// Constructor (Yapıcı Fonksiyon)
+MainWindow::MainWindow(QWidget *parent)
+    : QMainWindow(parent)
+    , ui(new Ui::MainWindow) // 'ui' nesnesini oluştur
+{
+    // Arayüz tasarımını (mainwindow.ui) yükle
+    ui->setupUi(this);
+
+    // 1. Dark Mode Stilini Uygula
+    applyStyleSheet();
+
+    // 2. Seri port nesnesini oluştur
+    serial = new QSerialPort(this);
+
+    // 3. PC'ye bağlı tüm COM portları bul ve 'comboBox'a ekle
+    const auto ports = QSerialPortInfo::availablePorts();
+    for (const QSerialPortInfo &port : ports) {
+        ui->comboBox->addItem(port.portName());
+    }
+
+    // 4. Baud Rate listesini (baudRateComboBox) doldur
+    ui->baudRateComboBox->addItem("115200");
+    ui->baudRateComboBox->addItem("9600");
+    ui->baudRateComboBox->addItem("38400");
+    ui->baudRateComboBox->addItem("57600");
+
+    // 5. Başlangıçta "Bağlantı Kes" ve "Gönder" butonlarını pasif yap
+    ui->baglantiKesButton->setEnabled(false);
+    ui->gonderButton->setEnabled(false); // Bağlantı kurulana kadar gönderme yapamasın
+
+    // 6. Serial porttan veri geldiğinde 'on_serial_readyRead' fonksiyonunu çağır
+    connect(serial, &QSerialPort::readyRead, this, &MainWindow::on_serial_readyRead);
+
+    // 7. YENİ ADIM: GÖSTERGEYİ OLUŞTUR VE EKLE
+    // m_dialWidget = new DialWidget(this); // Gösterge nesnesini oluştur
+
+    // "Bağlantı Bilgileri" kutusunun bir layout'u olduğundan emin ol
+    // (Eğer .ui dosyasında bu kutuya sağ tıklayıp "Layout > Lay Out Vertically" yapmadıysanız,
+    //  bu kod yeni bir layout oluşturur ve 'statusLabel'i de ona ekler)
+    //  .ui dosyasındaki GroupBox'ınızın 'objectName'inin 'baGlantiBilgileriGroupBox' olduğundan emin olun!
+    // QVBoxLayout *infoLayout = qobject_cast<QVBoxLayout*>(ui->baGlantiBilgileriGroupBox->layout());
+    // if (!infoLayout) {
+    //     infoLayout = new QVBoxLayout();
+    //     infoLayout->addWidget(ui->statusLabel); // Mevcut statusLabel'i layout'a taşı
+    //     ui->baGlantiBilgileriGroupBox->setLayout(infoLayout);
+    // }
+
+    // Yeni göstergeyi bu layout'a (statusLabel'in altına) ekle
+    // infoLayout->addWidget(m_dialWidget);
+}
+
+
+// Destructor (Yıkıcı Fonksiyon)
+MainWindow::~MainWindow()
+{
+    // Program kapanırken seri portu düzgünce kapat
+    if (serial->isOpen()) {
+        serial->close();
+    }
+    delete serial; // 'serial' nesnesini sil
+    delete ui;     // 'ui' nesnesini sil
+}
+
+// "Bağlantı Kur" butonuna tıklandığında çalışacak kod
+void MainWindow::on_baglanButton_clicked()
+{
+    QString portName = ui->comboBox->currentText();
+    if (portName.isEmpty()) {
+        ui->logTerminal->append("<font color=\"red\"><b>HATA: Lütfen bir COM portu seçin.</b></font>");
+        return;
+    }
+    serial->setPortName(portName);
+    serial->setBaudRate(ui->baudRateComboBox->currentText().toInt());
+    serial->setDataBits(QSerialPort::Data8);
+    serial->setParity(QSerialPort::NoParity);
+    serial->setStopBits(QSerialPort::OneStop);
+
+    if (serial->open(QIODevice::ReadWrite)) {
+        // Arayüzü "Bağlandı" durumuna geçir
+        ui->baglanButton->setEnabled(false);
+        ui->baglantiKesButton->setEnabled(true);
+        ui->gonderButton->setEnabled(true);
+        ui->comboBox->setEnabled(false);
+        ui->baudRateComboBox->setEnabled(false);
+
+        ui->statusLabel->setText("Durum : <font color=\"#28a745\">Bağlantı Kuruldu</font>");
+        ui->logTerminal->append("<font color=\"#28a745\"><b>" + portName + " portuna bağlanıldı.</b></font>");
+
+        // Bağlanınca göstergeyi sıfırla
+        // m_dialWidget->setChannel(-1); // Kanalı "boş" yap
+        // m_dialWidget->setCurrent(0.0); // Akımı 0 yap
+    } else {
+        qDebug() << "Port açılamadı!";
+        ui->statusLabel->setText("Durum : <font color=\"red\">Bağlı Değil</font>");
+        ui->logTerminal->append("<font color=\"red\"><b>HATA: " + portName + " portu açılamadı! (Başka bir program kullanıyor olabilir)</b></font>");
+    }
+}
+
+// "Bağlantı Kes" butonuna tıklandığında
+void MainWindow::on_baglantiKesButton_clicked()
+{
+    if (serial->isOpen()) {
+        serial->close();
+
+        // Arayüzü "Bağlantı Kesildi" durumuna geçir
+        ui->baglanButton->setEnabled(true);
+        ui->baglantiKesButton->setEnabled(false);
+        ui->gonderButton->setEnabled(false);
+        ui->comboBox->setEnabled(true);
+        ui->baudRateComboBox->setEnabled(true);
+
+        ui->statusLabel->setText("Durum : <font color=\"red\">Bağlı Değil</font>");
+        ui->logTerminal->append("<font color=\"red\"><b>Bağlantı Kesildi.</b></font>");
+
+        // Bağlantı kesilince göstergeyi sıfırla
+        // m_dialWidget->setChannel(-1);
+        // m_dialWidget->setCurrent(0.0);
+    }
+}
+
+// "Temizle" butonuna tıklandığında
+void MainWindow::on_temizleButton_clicked()
+{
+    ui->logTerminal->clear();
+}
+
+
+// "GÖNDER" butonuna tıklandığında
+void MainWindow::on_gonderButton_clicked()
+{
+    if (!serial->isOpen()) {
+        ui->logTerminal->append("<font color=\"red\"><b>HATA: Komut gönderilemedi. Port bağlı değil!</b></font>");
+        return;
+    }
+
+    // 1. Arayüzden değerleri al
+    int kanal = ui->spinBox->value(); // Kanal (0-6)
+    double akim_mA = ui->doubleSpinBox->value(); // Akım (-20.0 ila +20.0)
+
+    // 2. Akım Değerini İstenen Formata Çevir (10.5mA -> 10500)
+    int komutDegeri = (int)(akim_mA * 1000.0);
+
+    // 3. STM32'ye göndermek için komut metnini oluştur
+    // Format: "SET:Kanal:Değer\n"
+    QString command = QString("SET:%1:%2\n").arg(kanal).arg(komutDegeri);
+
+    // 4. Komutu seri porttan gönder
+    serial->write(command.toUtf8());
+
+    // 5. Gönderilen komutu terminale yazdır
+    ui->logTerminal->append(QString("TX: %1").arg(command.trimmed()));
+
+    // 6. YENİ ADIM: GÖSTERGEYİ GÜNCELLE
+    // m_dialWidget->setChannel(kanal);
+    // m_dialWidget->setCurrent(akim_mA);
+}
+
+// STM32'den seri port aracılığıyla bir veri geldiğinde bu fonksiyon çalışır
+void MainWindow::on_serial_readyRead()
+{
+    while (serial->canReadLine()) {
+        QByteArray data = serial->readLine();
+        // Gelen veriyi (mavi-yeşil renkte) terminale yazdır
+        ui->logTerminal->append(QString("<font color=\"#34c2eb\">RX: %1</font>")
+                                    .arg(QString::fromUtf8(data).trimmed()));
+
+        // Gelişmiş Adım (İsteğe bağlı):
+        // STM32'den gelen cevabı (RX) parse edip göstergeyi de güncelleyebilirsiniz.
+        // Örn: Gelen veri "CH:0,CUR:10.5" ise:
+        // m_dialWidget->setChannel(0);
+        // m_dialWidget->setCurrent(10.5);
+    }
+}
+
+// Dark Mode stil kodunu (QSS) uygular
+void MainWindow::applyStyleSheet()
+{
+    QString qss = R"(
+        /* Ana Pencere ve Arkaplan */
+        QMainWindow, QWidget {
+            background-color: #282c34;
+        }
+
+        /* Grup Kutuları (Bağlantı Ayarları, Terminal vb.) */
+        QGroupBox {
+            background-color: #3c4049;
+            border: 1px solid #545862;
+            border-radius: 8px;
+            margin-top: 10px; /* Başlık için yer aç */
+            font-weight: bold;
+        }
+
+        /* Grup Kutusu Başlıkları */
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            subcontrol-position: top center;
+            padding: 0 10px;
+            background-color: #3c4049;
+            color: #abb2bf;
+        }
+
+        /* Tüm Yazılar (Label) */
+        QLabel {
+            color: #abb2bf;
+            font-weight: bold;
+            background-color: transparent; /* Grup kutusunun içindeki label'lar için */
+        }
+
+        /* Bağlantı Bilgileri - Durum Yazısı (Özelleştirme) */
+        #statusLabel {
+            color: #abb2bf;
+            font-size: 14px;
+        }
+
+        /* ComboBox (Port Listesi) ve SpinBox (Sayı Kutuları) */
+        QComboBox, QSpinBox, QDoubleSpinBox {
+            background-color: #21252b;
+            color: #d4d4d4;
+            border: 1px solid #545862;
+            border-radius: 4px;
+            padding: 5px;
+        }
+
+        QComboBox::drop-down, QSpinBox::up-button, QSpinBox::down-button, QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+            border: 1px solid #545862;
+            background-color: #282c34;
+            color: #d4d4d4;
+        }
+
+        QComboBox QAbstractItemView {
+            background-color: #21252b;
+            color: #d4d4d4;
+            selection-background-color: #007bff;
+        }
+
+        /* Terminal Ekranı */
+        QTextBrowser {
+            background-color: #1e1e1e;
+            color: #d4d4d4;
+            border: 1px solid #545862;
+            border-radius: 4px;
+        }
+
+        /* Tüm Butonlar (Varsayılan Stil) */
+        QPushButton {
+            color: white;
+            background-color: #545862;
+            border: none;
+            border-radius: 5px;
+            padding: 10px;
+            font-weight: bold;
+        }
+
+        QPushButton:hover {
+            background-color: #6a6e78;
+        }
+
+        QPushButton:pressed {
+            background-color: #4a4e58;
+        }
+
+        /* Pasif (Disabled) Buton Stili */
+        QPushButton:disabled {
+            background-color: #4a4e58;
+            color: #888;
+        }
+
+        /* --- BUTONLARI objectName'e GÖRE ÖZELLEŞTİRME --- */
+
+        /* Bağlantı Kur Butonu (Yeşil) */
+        #baglanButton {
+            background-color: #28a745; /* Yeşil */
+        }
+        #baglanButton:hover {
+            background-color: #218838;
+        }
+        #baglanButton:pressed {
+            background-color: #1e7e34;
+        }
+
+        /* Bağlantı Kes Butonu (Kırmızı) */
+        #baglantiKesButton {
+            background-color: #dc3545; /* Kırmızı */
+        }
+        #baglantiKesButton:hover {
+            background-color: #c82333;
+        }
+        #baglantiKesButton:pressed {
+            background-color: #bd2130;
+        }
+
+        /* GÖNDER Butonu (Mavi) */
+        #gonderButton {
+            background-color: #007bff; /* Mavi */
+        }
+        #gonderButton:hover {
+            background-color: #0069d9;
+        }
+        #gonderButton:pressed {
+            background-color: #0062cc;
+        }
+
+        /* Temizle Butonu (Sarı/Turuncu) */
+        #temizleButton {
+            background-color: #ffc107; /* Sarı */
+            color: #21252b; /* Koyu yazı */
+        }
+        #temizleButton:hover {
+            background-color: #e0a800;
+        }
+        #temizleButton:pressed {
+            background-color: #d39e00;
+        }
+    )";
+
+    // Stili ana pencereye uygula
+    this->setStyleSheet(qss);
+}
+
