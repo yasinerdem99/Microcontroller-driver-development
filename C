@@ -1,0 +1,74 @@
+# STM32 Tabanlı Çok Kanallı Analog Sinyal Üreteci
+
+Bu proje, HAVELSAN stajı kapsamında geliştirilmiş, STM32F4xx tabanlı, UART ile kontrol edilebilen bir AC/DC analog çıkış modülüdür.
+
+Proje, MAXREFDES24 (4-Kanal Akım/Voltaj Çıkış) modüllerini kullanarak, savunma sanayi test sistemlerine yönelik sinyal üretimi sağlar.
+
+## 🛠️ Temel Özellikler
+
+* **5 Kanal DC Çıkış:** Kanal 0, 1, 2, 3, 5
+* **1 Kanal AC Sinyal Çıkışı:** Kanal 4
+* **AC Sinyal:** $\pm20\text{mA}$ aralığında, $0\text{mA}$ merkezli, frekansı ve genliği ayarlanabilir sinüs dalgası.
+* **Genlik Haritalama (AC):** AC kanalı, aşağıdaki parçalı doğrusal (piecewise) mantığa göre genlik üretir.
+* **Kontrol Arayüzü:** UART üzerinden özel NMEA benzeri komut protokolü.
+* **Performans:** 16-örneklemeli (`SINE_LUT_SIZE=16`) optimize edilmiş Timer ISR (kesme) kullanarak 1kHz+ frekanslarda kilitlenmesiz (live-lock free) çalışma.
+
+---
+
+## 📂 Klasör Yapısı
+
+* `/fw`: STM32CubeIDE'de açılacak olan gömülü bellenim (firmware) kodları.
+* `/hw`: Modül şemaları ve kullanılan entegrelerin veri sayfaları (datasheet).
+* `/sw`: Projeyi test etmek için kullanılan bilgisayar taraflı yazılımlar (örn: Python test script'leri).
+
+---
+
+## ⚙️ Donanım Kurulumu
+
+* **MCU:** STM32F4xx Nucleo Kartı
+* **Analog Modüller:** 2 adet MAXREFDES24 (Toplam 8 kanal sağlar, 6'sı kullanılır)
+    * `dev1` (DC Kanallar 0-3): `SPI1` portuna bağlı.
+    * `dev2` (AC Kanal 4 & DC Kanal 5): `SPI2` portuna bağlı (SPI hızı 8Mbit/s'e ayarlı).
+* **Bağlantı:** AC sinyal çıkışı (`dev2, ch0`) ve DC çıkışı (`dev2, ch1`) aynı SPI portunu (`SPI2`) paylaştığı için, `main.c` içinde `__disable_irq()` / `__enable_irq()` kritik bölge koruması uygulanmıştır.
+
+---
+
+## UART Komut Arayüzü (API)
+
+Tüm komutlar `CR+LF` (\r\n) ile bitmelidir.
+
+**Format:** `$SCCON,CH,VAL,FREQ*hh`
+* **CH:** Kanal Numarası (0-5)
+* **VAL:** İstenen değer (DC için akım, AC için genlik komutu)
+* **FREQ:** Sadece AC kanalı (Kanal 4) için kullanılır. DC kanallar bu parametreyi görmezden gelir.
+* **hh:** `$` ile `*` arasındaki tüm karakterlerin XOR checksum değeri.
+
+### 1. DC Çıkış (Kanal 0, 1, 2, 3, 5)
+
+`VAL` değeri `float` akım değerinin 1000 ile çarpımıdır.
+* **Örnek (12.5mA):** `$SCCON,1,12500*hh`
+* **Örnek (-5.0mA):** `$SCCON,1,-5000*hh`
+
+### 2. AC Çıkış (Kanal 4)
+
+`VAL` değeri, sinyalin tepe (peak) genliğini belirlemek için aşağıdaki parçalı doğrusal mantığı kullanır:
+
+| Gönderilen `VAL` Komutu | Hedeflenen Tepe Akımı (Peak) |
+| :--- | :--- |
+| `20000` (+20) | $20.0 \text{ mA}$ |
+| `10000` (+10) | $15.0 \text{ mA}$ |
+| `0` (Sıfır) | $10.0 \text{ mA}$ |
+| `-10000` (-10) | $6.11 \text{ mA}$ |
+| `-20000` (-20) | $2.22 \text{ mA}$ |
+
+* **Örnek (10.0mA Tepe Genlikli 1kHz Sinyal):**
+    `$SCCON,4,0,1000*hh`
+* **Örnek (2.22mA Tepe Genlikli 500Hz Sinyal):**
+    `$SCCON,4,-20000,500*hh`
+
+---
+
+## ⚠️ Bilinen Sorunlar / Limitler
+
+* **Frekans Limiti:** `ac_signal.c` içindeki `MAX_SAFE_FREQUENCY` (şu anda 2500 Hz) üzerindeki frekans komutları, kilitlenmeyi önlemek için reddedilir.
+* **Gürültü:** Yüksek SPI hızlarında (8Mbit/s) çalışırken, AC kanalının gürültüsü DC kanallarında "titreşim" (0-3mA arası oynama) olarak gözlemlenebilir. Bu bir yazılım hatası değil, donanımsal diyafoni (crosstalk) sorunudur.
