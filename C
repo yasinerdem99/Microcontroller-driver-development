@@ -15,6 +15,22 @@ Proje, MAXREFDES24 (4-Kanal Akım/Voltaj Çıkış) modüllerini kullanarak, sav
 
 ---
 
+---
+
+## 🔧 Kullanılan Araçlar ve Versiyonlar
+
+Bu proje aşağıdaki araçlar ve kütüphaneler kullanılarak geliştirilmiştir:
+
+* **IDE:** STM32CubeIDE (Versiyon: `1.1x.x`)
+* **Kod Üretici:** STM32CubeMX (Versiyon: `6.x.x`)
+* **Firmware Kütüphanesi:** STM32Cube FW_F4 V1.27.0 (veya kullandığınız F4 HAL versiyonu)
+* **Hata Ayıklayıcı (Debugger):** ST-Link (V2 veya V3)
+* **Belgelendirme (Dokümantasyon):** Doxygen (Versiyon: `1.x.x`)
+* **Terminal:** PuTTY / Tera Term (veya kullandığınız seri port monitörü)
+
+---
+
+
 ## 📂 Klasör Yapısı
 
 * `/fw`: STM32CubeIDE'de açılacak olan gömülü bellenim (firmware) kodları.
