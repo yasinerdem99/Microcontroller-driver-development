@@ -1,0 +1,99 @@
+# STM32-Based Multi-Channel Analog Signal Generator
+
+This project is an STM32F4xx-based, UART-controlled analog signal generator developed as part of an internship at HAVELSAN. It is designed to produce high-frequency AC and stable DC analog outputs for defense industry test systems using MAXREFDES24 analog output modules.
+
+## Key Features
+
+* **5 DC Output Channels:** Channels 0, 1, 2, 3, and 5.
+* **1 AC Signal Output Channel:** Channel 4 (configurable frequency and amplitude).
+* **Piecewise Amplitude Mapping:** The AC channel uses a non-linear mapping where the input command (`VAL`) determines the peak (tepe) amplitude.
+* **UART Control:** Controlled via a custom NMEA-like protocol (`$SCCON,CH,VAL,FREQ*hh`).
+* **High-Frequency Performance:** Optimized Timer ISR (using `SINE_LUT_SIZE=16`) ensures live-lock-free (kilitlenmesiz) operation for frequencies up to 1kHz+.
+
+---
+
+## 🔧 Tools & Environment
+
+* **IDE:** STM32CubeIDE (Version: 1.1x.x)
+* **Code Generator:** STM32CubeMX (Version: 6.x.x)
+* **Firmware Library:** STM32Cube FW_F4 V1.27.0 (or relevant HAL version)
+* **Debugger:** ST-Link (V2/V3)
+* **Host GUI:** Qt (C++)
+* **Documentation:** Doxygen
+
+---
+
+## 📂 Directory Structure
+
+* `/fw`: Contains the embedded firmware (the STM32CubeIDE project).
+* `/hw`: Contains all hardware-related files (datasheets, schematics).
+* `/sw`: Contains host-side software, including the Qt Test GUI.
+
+---
+
+## ⚙️ Hardware Setup
+
+* **MCU:** STM32F4xx Series (e.g., Nucleo-F407)
+* **Analog Modules:** 2x MAXREFDES24 (6 channels utilized)
+    * **`dev1` (DC Channels 0-3):** Connected to `SPI1`.
+    * **`dev2` (AC Ch 4 & DC Ch 5):** Connected to `SPI2`.
+* **SPI Speed:** `SPI2` is set to **8 Mbit/s** (APB1=32MHz, Prescaler=4) as this was found to be the stable "sweet spot" to prevent both ISR live-lock and high-speed signal integrity issues (crosstalk).
+* **Critical Section:** Because the AC signal (Ch 4) and a DC signal (Ch 5) share the same `SPI2` bus, a critical section (`__disable_irq() / __enable_irq()`) is implemented in `main.c` when accessing DC Channel 5. This prevents the high-frequency AC Timer ISR from colliding with a DC command.
+
+---
+
+##  UART Command Interface (API)
+
+All commands must be terminated with `CR+LF` (`\r\n`).
+
+**Format:** `$SCCON,CH,VAL,FREQ*hh`
+* **CH:** Channel Number (0-5)
+* **VAL:** The desired value.
+* **FREQ:** Used only for AC channel (Ch 4). Ignored by DC channels.
+* **hh:** 8-bit XOR checksum of all characters between `$` and `*`.
+
+### 1. DC Output (Channels 0, 1, 2, 3, 5)
+
+`VAL` is the desired float current (in mA) multiplied by 1000.
+* **Example (12.5mA):** `$SCCON,1,12500*hh`
+* **Example (-5.0mA):** `$SCCON,1,-5000*hh`
+
+### 2. AC Output (Channel 4)
+
+`VAL` is a command value (from -20000 to +20000) that is mapped to a specific **peak (tepe) amplitude** using the following piecewise linear logic:
+
+| `VAL` Command Sent | Target Peak Amplitude |
+| :--- | :--- |
+| `20000` (+20) | $20.0 \text{ mA}$ |
+| `10000` (+10) | $15.0 \text{ mA}$ |
+| `0` (Zero) | $10.0 \text{ mA}$ |
+| `-10000` (-10) | $6.11 \text{ mA}$ |
+| `-20000` (-20) | $2.22 \text{ mA}$ |
+
+* **Example (10.0mA Peak Amplitude @ 1kHz):**
+    `$SCCON,4,0,1000*hh`
+* **Example (Stop Signal):**
+    `$SCCON,4,0,0*hh`
+
+---
+
+## 🖥️ Host GUI (Test Software)
+
+A companion test application was developed using **Qt (C++)** to facilitate easy control and debugging of the signal generator. This application is located in the `/sw/` directory.
+
+### Features
+
+* **Automatic COM Port Detection:** Scans and lists available COM ports, allowing for quick connection to the STM32 device.
+* **Parameter Inputs:** Provides dedicated input fields for Channel (`CH`), Value (`VAL`), and Frequency (`FREQ`).
+* **NMEA Sentence Generation:** Automatically calculates the XOR checksum (`*hh`) and constructs the valid `$SCCON` command string based on the user's inputs.
+* **Integrated Terminal:** A built-in terminal window sends the generated command and displays the raw serial output (e.g., `printf` acknowledgments or error messages) received back from the STM32 device.
+
+
+
+---
+
+## ⚠️ Known Issues & Limitations
+
+* **Frequency Limit:** Commands exceeding `MAX_SAFE_FREQUENCY` (defined in `main.c`, e.g., 2500 Hz) are rejected by the software to prevent ISR live-lock, as the "slow ISR" (`max24_setChannelCurrent`) is used.
+* **Crosstalk (Noise):** Due to the high-speed (8Mbit/s) SPI signaling for the AC channel, digital noise (crosstalk) may be observed on the idle DC channels (e.g., 0-3mA fluctuation on a DC multimeter). This is a hardware signal integrity issue, not a software bug.
+* **Zero-Point Calibration:** The 0mA center point (`32768`) may be slightly offset (`-5` on the receiver). This can be corrected by defining and using `CALIBRATED_ZERO_POINT` in `ac_signal.c`.
