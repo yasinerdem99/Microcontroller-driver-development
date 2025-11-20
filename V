@@ -1,0 +1,94 @@
+/* Standart kütüphaneler */
+#include <stdio.h>
+#include <conio.h>
+#include <windows.h>
+
+/* FreeRTOS kütüphaneleri */
+#include "FreeRTOS.h"
+#include "task.h"
+#include "queue.h" /* KUYRUK Kütüphanesi eklendi! */
+
+/* --------------------------------------------------- */
+
+/* Kuyruk Tanımlayıcısı (Handle) */
+QueueHandle_t xQueue;
+
+/* Renk Fonksiyonu */
+void SetColor(int colorCode) {
+    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
+    SetConsoleTextAttribute(hConsole, colorCode);
+}
+
+void vBlinkyKeyboardInterruptHandler( void ) {}
+
+/* Görev Fonksiyonları */
+static void prvPingTask( void *pvParameters );
+static void prvPongTask( void *pvParameters );
+
+/* --------------------------------------------------- */
+
+void main_blinky( void )
+{
+    SetColor(15); // Beyaz
+    printf( "\n--- PING PONG (QUEUE) DEMOSU BASLIYOR ---\n\n" );
+
+    /* 1. KUYRUK OLUŞTURMA */
+    /* 5 tane tamsayı (int) tutabilen bir kuyruk oluştur */
+    xQueue = xQueueCreate( 5, sizeof( int ) );
+
+    if( xQueue != NULL )
+    {
+        /* Kuyruk oluştuysa görevleri yarat */
+        
+        /* PING Görevi (Gönderici) */
+        xTaskCreate( prvPingTask, "Ping", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL );
+
+        /* PONG Görevi (Alıcı) */
+        xTaskCreate( prvPongTask, "Pong", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL );
+
+        /* Zamanlayıcıyı Başlat */
+        vTaskStartScheduler();
+    }
+    else
+    {
+        printf("Kuyruk olusturulamadi!\n");
+    }
+
+    for( ;; );
+}
+
+/* --- PING GÖREVİ (Veri Gönderir) --- */
+static void prvPingTask( void *pvParameters )
+{
+    int gonderilenDeger = 100;
+    const TickType_t xDelay = pdMS_TO_TICKS( 1000UL ); // 1 saniye bekle
+
+    for( ;; )
+    {
+        /* Kuyruğa veri gönder (Wait süresi 0) */
+        xQueueSend( xQueue, &gonderilenDeger, 0 );
+
+        SetColor(11); // Açık Mavi
+        printf( "PING >> Veri Gonderildi (%d)\n", gonderilenDeger );
+        
+        gonderilenDeger++; /* Değeri değiştir */
+        vTaskDelay( xDelay );
+    }
+}
+
+/* --- PONG GÖREVİ (Veri Bekler ve Alır) --- */
+static void prvPongTask( void *pvParameters )
+{
+    int alinanDeger;
+
+    for( ;; )
+    {
+        /* Kuyruktan veri gelmesini bekle (portMAX_DELAY = sonsuza kadar bekle) */
+        /* Veri gelince uyanır ve aşağıdaki satıra geçer */
+        if( xQueueReceive( xQueue, &alinanDeger, portMAX_DELAY ) == pdPASS )
+        {
+            SetColor(14); // Sarı
+            printf( "               >> PONG: Veri Alindi (%d)\n", alinanDeger );
+        }
+    }
+}
