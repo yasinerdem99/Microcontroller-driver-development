@@ -2,7 +2,7 @@ void Xmodem_Receive_Hex_File(void)
 {
     uint8_t rx_buffer[133]; 
     uint8_t packet_number = 1;
-    uint8_t status;
+    uint8_t status = 0;
     uint8_t xmodem_done = 0;
     uint8_t hex_parsing_done = 0;
     
@@ -13,14 +13,14 @@ void Xmodem_Receive_Hex_File(void)
     uint32_t target_slot = 0;
     uint8_t is_flash_erased = 0;
     uint8_t rx_char;
-    uint32_t total_bytes = 0; // Progress için
+    uint32_t total_bytes = 0;
 
     /* Buffer Sıfırla */
     smart_base_addr = 0xFFFFFFFF;
     smart_dirty = 0;
     memset(smart_buffer, 0xFF, 16);
 
-    /* --- HEDEF BELİRLEME (Ping-Pong) --- */
+    /* --- HEDEF BELİRLEME --- */
     uint32_t current_active = Get_Active_Slot_Addr();
 
     printf("\r\n========================================\r\n");
@@ -44,44 +44,35 @@ void Xmodem_Receive_Hex_File(void)
         if (rx_char == 'n' || rx_char == 'N') { printf("\r\nIptal.\r\n"); return; }
     }
 
-    /* --- AKILLI BEKLEME (Smart Wait) --- */
-    printf("\r\n[HAZIR] Bekleniyor... (Iptal icin 'e' basin)\r\n");
+    /* --- SADELEŞTİRİLMİŞ BEKLEME EKRANI --- */
+    /* Yanıp sönme yok, sadece statik yazı var */
+    printf("\r\n[HAZIR] Dosya Bekleniyor... (Iptal icin 'e' basin)\r\n");
     
     uint32_t last_c_time = 0;
-    uint32_t last_blink_time = 0;
-    uint8_t blink_state = 0;
     uint8_t handshake_done = 0;
 
     while (!handshake_done) 
     {
         uint32_t current_time = HAL_GetTick();
 
-        /* 1 Saniyede bir 'C' gönder */
+        /* 1. Saniyede bir 'C' gönder (Arka Planda) */
         if (current_time - last_c_time > 1000) {
             uint8_t c = CHAR_C;
             HAL_UART_Transmit(&huart3, &c, 1, 100);
             last_c_time = current_time;
         }
 
-        /* Yanıp Sönen Yazı (500ms) */
-        if (current_time - last_blink_time > 500) {
-            if (blink_state) printf("\rDosya Bekleniyor...   "); 
-            else             printf("\rDosya Bekleniyor      ");
-            fflush(stdout);
-            blink_state = !blink_state;
-            last_blink_time = current_time;
-        }
-
-        /* Veri Geldi mi? (1ms Timeout) */
-        if (HAL_UART_Receive(&huart3, &status, 1, 1) == HAL_OK) 
+        /* 2. Veri Dinleme (Yanıp sönme kodu SILINDI) */
+        /* Sadece veri gelip gelmediğine bakıyoruz */
+        if (HAL_UART_Receive(&huart3, &status, 1, 10) == HAL_OK) 
         {
-            if (status == 'e' || status == 'E') { // Çıkış
+            if (status == 'e' || status == 'E') {
                 printf("\r\n[IPTAL] Kullanici iptal etti.\r\n");
                 return;
             }
-            if (status == SOH) { // Başla
+            if (status == SOH) {
                 handshake_done = 1;
-                printf("\r\nTransfer Basladi!\r\n");
+                /* Ekrana yazı basmıyoruz, direkt işe koyuluyoruz */
             }
         }
     }
@@ -89,21 +80,26 @@ void Xmodem_Receive_Hex_File(void)
     /* --- PAKET DÖNGÜSÜ --- */
     while (!xmodem_done) 
     {
-        rx_buffer[0] = status; 
+        rx_buffer[0] = status; // İlk byte (SOH)
+        
+        // Geri kalan 132 byte'ı oku
         if (HAL_UART_Receive(&huart3, &rx_buffer[1], 132, 2000) != HAL_OK) {
             uint8_t n = NAK; HAL_UART_Transmit(&huart3, &n, 1, 100);
-            HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
+            // Senkron bozulursa tekrar SOH bekle
+            HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); 
+            continue;
         }
         
         uint16_t rcrc = (rx_buffer[131] << 8) | rx_buffer[132];
         if (rcrc != Calc_CRC16_Hex(&rx_buffer[3], 128)) {
              uint8_t n = NAK; HAL_UART_Transmit(&huart3, &n, 1, 100);
-             HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
+             HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); 
+             continue;
         }
 
-        /* --- PROGRESS BAR (İlerleme) --- */
+        /* --- PROGRESS BAR --- */
         total_bytes += 128;
-        printf("\r[YUKLENIYOR] Paket: %3d | Toplam: %lu Bytes", packet_number, total_bytes);
+        printf("\r[YUKLENIYOR] Paket: %3d | Toplam: %lu Bytes   ", packet_number, total_bytes);
         fflush(stdout);
 
         /* --- HEX PARSING --- */
@@ -128,7 +124,7 @@ void Xmodem_Receive_Hex_File(void)
                         if (rec_type == 0x00) { // DATA
                             uint32_t current_addr = (hex_upper_addr << 16) | addr_low;
                             
-                            /* --- GUVENLIK VE SILME --- */
+                            /* GUVENLIK VE SILME */
                             if (is_flash_erased == 0) 
                             {
                                 uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
@@ -138,7 +134,7 @@ void Xmodem_Receive_Hex_File(void)
                                     printf("\r\n\r\n[HATA] Adres Uyusmazligi! Dosya: 0x%08lX\r\n", current_addr);
                                     return; 
                                 } else {
-                                    /* SESSİZ SİLME (Progress Bar bozulmasın diye yazı basmıyoruz) */
+                                    /* SESSİZ SİLME */
                                     if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
                                         uint8_t can = CAN;
                                         for(int k=0; k<5; k++) HAL_UART_Transmit(&huart3, &can, 1, 100);
@@ -178,16 +174,17 @@ void Xmodem_Receive_Hex_File(void)
         HAL_UART_Transmit(&huart3, &ack, 1, 100);
         packet_number++;
 
+        // Sonraki paketin SOH karakterini bekle
         HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY);
+        
         if (status == EOT) {
             HAL_UART_Transmit(&huart3, &ack, 1, 100);
             Flush_Smart_Buffer(); 
-            xmodem_done = 1;
-            
-            /* Slot Değiştir */
             if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
             else Set_Active_Slot(SLOT_A_ACTIVE);
+            
+            xmodem_done = 1;
         }
     }
-    printf("\r\n\n[OK] HEX Yukleme Basariyla Tamamlandi!\r\n");
+    printf("\r\n\n" CLR_GREEN "[OK] HEX Yukleme Basariyla Tamamlandi!" CLR_RESET "\r\n");
 }
