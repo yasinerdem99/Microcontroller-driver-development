@@ -1,11 +1,10 @@
 /*
- * RAW HEX YUKLEME (Surukle-Birak Icin)
- * Dikkat: Tera Term'de "Transmit Delay" ayari yapilmalidir!
- * Onerilen: 50ms/line
+ * RAW HEX YUKLEME (INTERRUPTSIZ / POLLING)
+ * DIKKAT: Tera Term'de "Transmit delay -> msec/line: 50" ayari SARTTIR!
  */
 void Receive_Raw_Hex_File(void)
 {
-    char line_buffer[256];
+    char line_buffer[512]; // Uzun satırlar için geniş tampon
     uint16_t line_idx = 0;
     uint8_t rx_char;
     uint8_t file_started = 0;
@@ -15,104 +14,125 @@ void Receive_Raw_Hex_File(void)
     uint32_t current_addr = 0;
     uint32_t target_slot = 0;
     uint8_t is_flash_erased = 0;
+    uint32_t line_count = 0;
 
-    /* Smart Buffer Sıfırla */
+    char sub_cmd[10];
+
+    /* Buffer Sıfırla */
     smart_base_addr = 0xFFFFFFFF;
     smart_dirty = 0;
     memset(smart_buffer, 0xFF, 16);
 
-    /* --- HEDEF BELİRLEME --- */
-    uint32_t current_active = Get_Active_Slot_Addr();
-    printf("\r\n========================================\r\n");
-    if (current_active == SLOT_A_ADDR) {
-        target_slot = SLOT_B_ADDR;
-        printf(" Mevcut: A (Aktif) -> HEDEF: B (0x%08lX)\r\n", target_slot);
-    } else {
+    /* --- HEDEF SEÇİMİ --- */
+    printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Hangi Slota Yukleme Yapilacak? (a/b) > ");
+    fflush(stdout);
+    Hex_Read_Line(sub_cmd, 10);
+
+    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
         target_slot = SLOT_A_ADDR;
-        printf(" Mevcut: B (Aktif) -> HEDEF: A (0x%08lX)\r\n", target_slot);
+        printf("HEDEF: SLOT A (0x%08lX)\r\n", target_slot);
     }
-    printf("========================================\r\n");
-    
-    printf(CLR_YELLOW "DIKKAT: Tera Term 'Setup -> Serial -> Transmit delay' ayarindan\r\n");
-    printf("        'msec/line' degerini en az 20ms yapin!\r\n" CLR_RESET);
+    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
+        target_slot = SLOT_B_ADDR;
+        printf("HEDEF: SLOT B (0x%08lX)\r\n", target_slot);
+    }
+    else {
+        printf("\r\n[IPTAL] Gecersiz secim.\r\n");
+        return;
+    }
+
+    printf(CLR_YELLOW "\r\nDIKKAT: Tera Term 'Transmit delay' ayarini 50ms yapin!\r\n" CLR_RESET);
     printf("Hazir. Dosyayi surukleyip birakabilirsiniz...\r\n");
 
+    last_rx_time = HAL_GetTick();
+
+    /* --- DÖNGÜ BAŞLIYOR --- */
     while(1)
     {
         /* 1 Karakter Oku (Timeout 1 saniye) */
-        /* Eğer 2 saniye boyunca hiç veri gelmezse ve dosya başladıysa, bitti kabul et */
-        if (HAL_UART_Receive(&huart3, &rx_char, 1, 1000) != HAL_OK) 
+        /* Veri gelmezse bekler, gelince hemen alır */
+        if (HAL_UART_Receive(&huart3, &rx_char, 1, 1000) == HAL_OK) 
         {
-            if (file_started && (HAL_GetTick() - last_rx_time > 2000)) {
-                break; // Timeout -> Dosya Bitti
-            }
-            continue;
-        }
+            last_rx_time = HAL_GetTick();
+            file_started = 1;
 
-        last_rx_time = HAL_GetTick();
-        file_started = 1;
-
-        /* Satır Sonu Kontrolü */
-        if (rx_char == '\n' || rx_char == '\r') 
-        {
-            if (line_idx > 0) /* Tamponda veri varsa işle */
+            /* Satır Sonu Kontrolü */
+            if (rx_char == '\n' || rx_char == '\r') 
             {
-                line_buffer[line_idx] = '\0'; // String kapat
-                
-                /* --- HEX PARSING --- */
-                if (line_buffer[0] == ':') /* Geçerli HEX satırı mı? */
+                if (line_idx > 0) /* Tamponda veri varsa işle */
                 {
-                    uint8_t byte_count = ParseByte(&line_buffer[1]);
-                    uint16_t addr_low  = (ParseByte(&line_buffer[3]) << 8) | ParseByte(&line_buffer[5]);
-                    uint8_t rec_type   = ParseByte(&line_buffer[7]);
+                    line_buffer[line_idx] = '\0'; // Stringi kapat
                     
-                    if (rec_type == 0x00) { /* DATA */
-                        current_addr = (hex_upper_addr << 16) | addr_low;
+                    /* --- HEX PARSING --- */
+                    if (line_buffer[0] == ':') /* Geçerli HEX satırı mı? */
+                    {
+                        uint8_t byte_count = ParseByte(&line_buffer[1]);
+                        uint16_t addr_low  = (ParseByte(&line_buffer[3]) << 8) | ParseByte(&line_buffer[5]);
+                        uint8_t rec_type   = ParseByte(&line_buffer[7]);
                         
-                        /* Güvenlik ve Silme (Sadece ilk veride) */
-                        if (is_flash_erased == 0) {
-                            uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
-                            if (check == 0 || check == 2) {
-                                printf("\r\n[HATA] Yanlis Adres! Islem Iptal.\r\n");
-                                return;
+                        /* DATA KAYDI (00) */
+                        if (rec_type == 0x00) { 
+                            current_addr = (hex_upper_addr << 16) | addr_low;
+                            
+                            /* Güvenlik ve Silme (Sadece ilk veride) */
+                            if (is_flash_erased == 0) {
+                                uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
+                                if (check == 0 || check == 2) {
+                                    printf("\r\n[HATA] Adres Uyusmazligi! Islem Iptal.\r\n");
+                                    return;
+                                }
+                                
+                                printf("[INFO] Adres Dogru. Siliniyor...\r\n");
+                                if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+                                    printf("[HATA] Silme Basarisiz!\r\n");
+                                    return;
+                                }
+                                is_flash_erased = 1;
                             }
-                            // Silme
-                            printf("[INFO] Siliniyor...\r\n");
-                            if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
-                                printf("[HATA] Silme Basarisiz!\r\n");
-                                return;
+                            
+                            /* Veriyi Smart Buffer'a işle */
+                            /* NOT: Burası Flash'a yazabilir, o yüzden PC beklemeli! */
+                            for(int k=0; k<byte_count; k++) {
+                                uint8_t val = ParseByte(&line_buffer[9 + (k*2)]);
+                                Smart_Hex_Write_Byte(current_addr + k, val);
                             }
-                            is_flash_erased = 1;
+                            
+                            /* Kullanıcıya çalıştığını göster (Nokta bas) */
+                            line_count++;
+                            if(line_count % 20 == 0) {
+                                HAL_UART_Transmit(&huart3, (uint8_t*)".", 1, 10);
+                            }
                         }
-                        
-                        /* Veriyi Tampona Al */
-                        for(int k=0; k<byte_count; k++) {
-                            uint8_t val = ParseByte(&line_buffer[9 + (k*2)]);
-                            Smart_Hex_Write_Byte(current_addr + k, val);
+                        /* DOSYA SONU (01) */
+                        else if (rec_type == 0x01) { 
+                            Flush_Smart_Buffer(); // Kalanları yaz
+                            goto TRANSFER_COMPLETE; // Çıkışa git
                         }
-                        
-                        /* Kullanıcıya Hayatta Olduğumuzu Göster */
-                        HAL_UART_Transmit(&huart3, (uint8_t*)".", 1, 10); 
+                        /* EXTENDED ADDRESS (04) */
+                        else if (rec_type == 0x04) { 
+                            uint8_t d1 = ParseByte(&line_buffer[9]);
+                            uint8_t d2 = ParseByte(&line_buffer[11]);
+                            hex_upper_addr = (d1 << 8) | d2;
+                        }
                     }
-                    else if (rec_type == 0x01) { /* EOF */
-                        Flush_Smart_Buffer();
-                        goto TRANSFER_COMPLETE; // Çıkışa git
-                    }
-                    else if (rec_type == 0x04) { /* EXT ADDR */
-                        uint8_t d1 = ParseByte(&line_buffer[9]);
-                        uint8_t d2 = ParseByte(&line_buffer[11]);
-                        hex_upper_addr = (d1 << 8) | d2;
-                    }
+                    line_idx = 0; // Tamponu sıfırla, yeni satıra hazırlan
                 }
-                
-                line_idx = 0; // Tamponu sıfırla
+            }
+            else 
+            {
+                /* Karakteri Biriktir */
+                if (line_idx < 511) {
+                    line_buffer[line_idx++] = rx_char;
+                }
             }
         }
         else 
         {
-            /* Karakteri Biriktir */
-            if (line_idx < 255) {
-                line_buffer[line_idx++] = rx_char;
+            /* Timeout Durumu (Veri Gelmiyor) */
+            /* Eğer dosya başladıysa ve 3 saniyedir veri yoksa bitti say */
+            if (file_started && (HAL_GetTick() - last_rx_time > 3000)) {
+                printf("\r\n[TIMEOUT] Veri akisi kesildi.\r\n");
+                break;
             }
         }
     }
