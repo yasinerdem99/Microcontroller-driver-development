@@ -1,6 +1,5 @@
 /*
- * RAW HEX YUKLEME (Sync-Lock Özellikli)
- * Adres kaymalarini ve gürültüyü %100 engeller.
+ * RAW HEX YUKLEME (Zorunlu Adres Senkronizasyonu)
  */
 void Receive_Raw_Hex_File(void)
 {
@@ -20,11 +19,15 @@ void Receive_Raw_Hex_File(void)
     
     /* Bayraklar */
     uint8_t success_flag = 0;
+    uint8_t address_set = 0; // <--- YENI: Adres ayarlandi mi?
 
     /* Değişkenleri Sıfırla */
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
-    rb_head = 0; rb_tail = 0; 
+    
+    /* Ring Buffer'ı Temizle */
+    rb_head = 0; 
+    rb_tail = 0; 
 
     /* --- HEDEF SEÇİMİ --- */
     printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
@@ -58,12 +61,10 @@ void Receive_Raw_Hex_File(void)
             file_started = 1;
 
             /* --- SENKRONİZASYON (SYNC LOCK) --- */
-            /* Eğer gelen karakter ':' ise, bu KESİN yeni bir satırdır. */
-            /* Önceki ne varsa sil, indeksi sıfırla ve bunu başa koy. */
             if (rx_char == ':') {
                 line_idx = 0;
-                line_buffer[line_idx++] = ':'; // Buffer'ın başına koy
-                continue; // Döngü başına dön, diğer kontrollere girme
+                line_buffer[line_idx++] = ':'; 
+                continue; 
             }
 
             /* Satır Sonu Kontrolü */
@@ -73,24 +74,35 @@ void Receive_Raw_Hex_File(void)
                     line_buffer[line_idx] = '\0'; // String kapat
                     
                     /* --- HEX PARSING --- */
-                    /* Sadece buffer ':' ile başlıyorsa işle */
                     if (line_buffer[0] == ':') {
                         uint8_t count = ParseByte(&line_buffer[1]);
                         uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
                         uint8_t type  = ParseByte(&line_buffer[7]);
                         
-                        /* ADRES KAYDI (Type 04) */
+                        /* ADRES KAYDI (Type 04) - İLK BUNU GÖRMELİYİZ! */
                         if (type == 0x04) { 
                             hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]);
+                            address_set = 1; // Adres kilitlendi, artık veri alabiliriz
                         }
+                        
                         /* DATA KAYDI (Type 00) */
                         else if (type == 0x00) { 
+                            /* EĞER ADRES HENÜZ AYARLANMADIYSA BU SATIRI YOK SAY! */
+                            /* Bu sayede baştaki gürültüden kaynaklı yanlış yazmaları engelleriz */
+                            if (address_set == 0) {
+                                line_idx = 0;
+                                continue; 
+                            }
+
                             current_addr = (hex_upper_addr << 16) | alow;
                             
                             /* Güvenlik ve Silme */
                             if (is_flash_erased == 0) {
                                 uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
                                 if (check != 1) { 
+                                    /* Hata verme, sadece bekle. Belki gürültüdür. */
+                                    /* Ama eğer 50 satır boyunca yanlışsa o zaman hata ver */
+                                    /* Şimdilik direkt hata verelim: */
                                     printf("\r\n[HATA] Yanlis Adres: 0x%08lX\r\n", current_addr);
                                     goto EXIT_TRANSFER; 
                                 }
@@ -117,15 +129,13 @@ void Receive_Raw_Hex_File(void)
                             goto EXIT_TRANSFER;
                         }
                     }
-                    // Satır bitti, indeksi sıfırla, yeni ':' bekle
                     line_idx = 0;
                 }
             } 
             else {
                 /* Karakter Biriktir */
-                /* Sadece line_idx 0 değilse (yani ':' geldiyse) kaydet */
                 if(line_idx > 0 && line_idx < 511) {
-                    /* Filtre: Sadece HEX karakterler */
+                    /* Sadece HEX karakterler */
                     if ((rx_char >= '0' && rx_char <= '9') || 
                         (rx_char >= 'A' && rx_char <= 'F') || 
                         (rx_char >= 'a' && rx_char <= 'f')) 
@@ -138,7 +148,8 @@ void Receive_Raw_Hex_File(void)
         else {
             /* Timeout: Dosya başladıysa ve 2 saniye ses yoksa bitir */
             if (file_started && (HAL_GetTick() - last_rx_time > 2000)) {
-                if(is_flash_erased) success_flag = 1; // Yazma başladıysa bitti say
+                // Eğer hiç veri yazılmadıysa HATA, yazıldıysa BİTTİ say
+                if(is_flash_erased) success_flag = 1;
                 goto EXIT_TRANSFER;
             }
         }
