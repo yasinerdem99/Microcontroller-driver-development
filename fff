@@ -1,5 +1,5 @@
 /*
- * RAW HEX YUKLEME (Adres Filtreli - Hata Toleranslı)
+ * RAW HEX YUKLEME (Address Config Fix)
  */
 void Receive_Raw_Hex_File(void)
 {
@@ -23,7 +23,7 @@ void Receive_Raw_Hex_File(void)
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
     rb_head = 0; rb_tail = 0; 
 
-    /* Hedef Seçimi */
+    /* --- HEDEF SEÇİMİ --- */
     printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
     fflush(stdout);
     Hex_Read_Line(sub_cmd, 10);
@@ -65,37 +65,41 @@ void Receive_Raw_Hex_File(void)
                 if (line_idx > 0) {
                     line_buffer[line_idx] = '\0';
                     
+                    /* --- HEX PARSING --- */
                     if (line_buffer[0] == ':') {
                         uint8_t count = ParseByte(&line_buffer[1]);
                         uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
                         uint8_t type  = ParseByte(&line_buffer[7]);
                         
-                        /* ADRES KAYDI (Type 04) - Üst adresi güncelle */
+                        /* --- KRİTİK DÜZELTME BURADA --- */
+                        
+                        /* TİP 04: EXTENDED LINEAR ADDRESS (Önce buna bak!) */
+                        /* Filtreleme yapmadan önce üst adresi güncellemeliyiz */
                         if (type == 0x04) { 
                             hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]);
+                            // Adres güncellendi, şimdi sonraki satırı bekle
+                            line_idx = 0; 
+                            continue;
                         }
-                        /* DATA KAYDI (Type 00) */
+
+                        /* TİP 00: DATA KAYDI */
                         else if (type == 0x00) { 
                             current_addr = (hex_upper_addr << 16) | alow;
                             
-                            /* --- FİLTRELEME (YENİ) --- */
-                            /* Eğer adres 0x08000000'dan küçükse (yani Flash değilse) yoksay */
-                            /* Bu sayede baştaki "0x0000..." gibi hatalı adresler işlemi durdurmaz */
+                            /* FİLTRE: Sadece DATA satırları için adres kontrolü yap */
+                            /* Eğer adres Flash bölgesinde değilse (0x000... vb) görmezden gel */
                             if (current_addr < 0x08000000) {
-                                line_idx = 0;
-                                continue; 
+                                line_idx = 0; continue; 
                             }
 
                             /* Güvenlik ve Silme */
                             if (is_flash_erased == 0) {
                                 uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
                                 if (check != 1) { 
-                                    /* Hata Bas ama hemen çıkma (Gürültü olabilir) */
-                                    /* Eğer 5 kere üst üste hata gelirse çık */
-                                    printf("\r\n[UYARI] Hatali Adres: 0x%08lX (Hedef: 0x%08lX)\r\n", current_addr, target_slot);
+                                    printf("\r\n[HATA] Adres Uyusmazligi! Dosya: 0x%08lX (Hedef: 0x%08lX)\r\n", current_addr, target_slot);
                                     goto EXIT_TRANSFER; 
                                 }
-                                printf("[INFO] Adres Dogru. Siliniyor..."); fflush(stdout);
+                                printf("[INFO] Siliniyor..."); fflush(stdout);
                                 if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
                                     printf("[FAIL]\r\n"); goto EXIT_TRANSFER;
                                 }
@@ -103,7 +107,7 @@ void Receive_Raw_Hex_File(void)
                                 is_flash_erased = 1;
                             }
                             
-                            /* Tampona yaz */
+                            /* Yazma */
                             for(int k=0; k<count; k++) {
                                 Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
                             }
@@ -111,7 +115,7 @@ void Receive_Raw_Hex_File(void)
                             byte_counter += count;
                             if(byte_counter % 1024 == 0) { printf("."); fflush(stdout); }
                         }
-                        /* DOSYA SONU (Type 01) */
+                        /* TİP 01: DOSYA SONU */
                         else if (type == 0x01) { 
                             success_flag = 1;
                             goto EXIT_TRANSFER;
@@ -130,8 +134,9 @@ void Receive_Raw_Hex_File(void)
             }
         }
         else {
-            /* Timeout: 3 Saniye sessizlik = Bitti */
-            if (file_started && (HAL_GetTick() - last_rx_time > 3000)) {
+            /* Timeout: Dosya başladıysa ve 2 saniye ses yoksa bitir */
+            if (file_started && (HAL_GetTick() - last_rx_time > 2000)) {
+                // Eğer yazma başladıysa EOF gelmese bile başarılı say (Raw mod toleransı)
                 if(is_flash_erased) success_flag = 1;
                 else printf("\r\n[TIMEOUT] Veri gelmedi.\r\n");
                 goto EXIT_TRANSFER;
