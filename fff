@@ -1,27 +1,29 @@
 /*
  * Bootloader_hex.c
- * FULL VERSION: XMODEM + RAW (STM32U5 Fix: Smart Default Address & Alignment)
+ * FULL VERSION: XMODEM + RAW (STM32U5 Native Quad-Word Fix)
+ * * COZULEN SORUN: Err: 0x88 (PGAERR | PROGERR)
+ * NEDENI: STM32U5 Flash'i sadece 128-bit (16 Byte) bloklar halinde yazilabilir.
+ * COZUM: Bootloader_Flash_Write yerine direkt HAL QuadWord komutu eklendi.
  */
 
 #include "Bootloader_hex.h"
 #include "Bootloader_flash.h"
 #include "Bootloader_config.h"
+#include "stm32u5xx_hal.h" // HAL kutuphanesini ekledik
 #include <stdio.h>
 #include <string.h>
 
 extern UART_HandleTypeDef huart3;
 
-#define RING_BUFFER_SIZE  16384 // 16KB Buffer
+#define RING_BUFFER_SIZE  16384
 static uint8_t  rb_data[RING_BUFFER_SIZE];
 static volatile uint16_t rb_head = 0;
 static volatile uint16_t rb_tail = 0;
 static uint8_t  rx_byte_it;
 
-/* --- STM32U5 İÇİN KRİTİK ALIGNMENT --- */
-/* uint32_t kullanarak 4-byte hizalamayı garantiliyoruz, 
-   aligned(16) ile de 128-bit hizalamayı zorluyoruz. */
+/* --- STM32U5 ICIN 128-BIT (16 BYTE) ALIGNMENT --- */
 static uint32_t smart_buffer32[4] __attribute__((aligned(16))); 
-static uint8_t *smart_buffer = (uint8_t*)smart_buffer32; // Byte erişimi için pointer
+static uint8_t *smart_buffer = (uint8_t*)smart_buffer32; 
 
 static uint32_t smart_base_addr = 0xFFFFFFFF;
 static uint8_t  smart_dirty = 0;
@@ -87,29 +89,38 @@ static void Hex_Read_Line(char *buffer, uint16_t max_len) {
     }
 }
 
-/* Tamponu Flash'a Yazar */
+/* * TAMPONU FLASH'A YAZAN KRITIK FONKSIYON 
+ * STM32U5 Icin Ozel Quad-Word (128-bit) Modu Eklendi
+ */
 static void Flush_Smart_Buffer(void) {
     if (smart_dirty && smart_base_addr != 0xFFFFFFFF) {
-        // Hata temizle
+        
+        // Hatalari temizle ki temiz baslayalim
         __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
         
-        // 16 Byte (128-bit) yaz
-        if (Bootloader_Flash_Write(smart_base_addr, smart_buffer, 16) != 0) {
-             // Hata olursa
-             printf(CLR_RED " [WR ERR 0x%08lX]" CLR_RESET, smart_base_addr);
+        /* * KRITIK DEGISIKLIK:
+         * Bootloader_Flash_Write yerine direkt HAL kutuphanesini kullaniyoruz.
+         * FLASH_TYPEPROGRAM_QUADWORD = 128 bit (16 byte) yazma modu.
+         * (uint32_t)smart_buffer32 -> Tamponun baslangic ADRESI verilir.
+         */
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, smart_base_addr, (uint32_t)smart_buffer32) != HAL_OK) 
+        {
+             uint32_t err = HAL_FLASH_GetError();
+             // Hata kodunu detayli bas (0x88 burada yakalanir)
+             printf(CLR_RED " [WR ERR Adr:0x%08lX Kod:0x%X]" CLR_RESET, smart_base_addr, (unsigned int)err);
         }
+        
         smart_dirty = 0;
     }
 }
 
-/* Akıllı Byte Yazma: 16'lı gruplar halinde tamponlar */
 static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
-    uint32_t aligned_base = addr & 0xFFFFFFF0; // 16-byte tabana yuvarla
+    uint32_t aligned_base = addr & 0xFFFFFFF0; // 16-byte tabana hizala
     uint8_t offset = addr & 0x0F;
 
     if (aligned_base != smart_base_addr) {
         Flush_Smart_Buffer();
-        memset(smart_buffer, 0xFF, 16); // Yeni bloğu FF ile doldur (Padding)
+        memset(smart_buffer, 0xFF, 16); // Yeni 16'lik blogu temizle (FF)
         smart_base_addr = aligned_base;
         smart_dirty = 0;
     }
@@ -118,10 +129,8 @@ static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
 }
 
 static uint8_t Check_Hex_Address_Range(uint32_t addr, uint32_t target_slot) {
-    // Sadece Flash Bölgesi (0x08xxxxxx)
     if ((addr & 0xFF000000) != 0x08000000) return 0;
-
-    if (addr >= 0x08000000 && addr < 0x08010000) return 2; // Boot
+    if (addr >= 0x08000000 && addr < 0x08010000) return 2;
     if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
     if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
     return 0;
@@ -131,7 +140,6 @@ static uint8_t Check_Hex_Address_Range(uint32_t addr, uint32_t target_slot) {
 /* FONKSIYON: RAW HEX YUKLEME (RAM BUFFERED)                    */
 /* ============================================================ */
 
-/* RAM Buffer (48KB - STM32U5 için yeterli) */
 #define RAM_FILE_BUFFER_SIZE  48000
 static uint8_t g_ram_buffer[RAM_FILE_BUFFER_SIZE];
 static uint32_t g_ram_idx = 0;
@@ -146,11 +154,9 @@ void Receive_Raw_Hex_File(void)
     char line_buffer[512];
     uint16_t line_idx = 0;
     
-    // İstatistikler
     uint32_t written_byte_count = 0;
     uint32_t skipped_byte_count = 0;
 
-    // Başlangıç Ayarları
     g_ram_idx = 0;
     smart_base_addr = 0xFFFFFFFF;
     smart_dirty = 0;
@@ -161,53 +167,35 @@ void Receive_Raw_Hex_File(void)
     fflush(stdout);
     Hex_Read_Line(sub_cmd, 10);
 
-    /* --- ADRES BAŞLANGIÇ AYARI (SMART DEFAULT) --- */
-    /* Dosyanın başındaki :02000004... satırı kaçarsa diye,
-       varsayılan adresi seçilen Slota göre kuruyoruz. */
-    
+    /* SMART DEFAULT ADDRESS */
     if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
         target_slot = SLOT_A_ADDR;
-        hex_upper_addr = 0x0801; // Varsayılan: Slot A (0x0801xxxx)
+        hex_upper_addr = 0x0801; 
     }
     else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
         target_slot = SLOT_B_ADDR;
-        hex_upper_addr = 0x0820; // Varsayılan: Slot B (0x0820xxxx) - Cihaza göre değişebilir
+        hex_upper_addr = 0x0820; 
     }
-    else { 
-        printf("\r\nIptal.\r\n"); return; 
-    }
+    else { printf("\r\nIptal.\r\n"); return; }
 
-    /* --- VERİ ALMA DÖNGÜSÜ --- */
     printf("\r\nDosyayi simdi surukleyin... (Bekleniyor)\r\n");
-
     __HAL_UART_CLEAR_OREFLAG(&huart3);
     HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
     last_rx_time = HAL_GetTick();
 
     while(1)
     {
-        if (Ring_Buffer_Read(&rx_char) == 0)
-        {
+        if (Ring_Buffer_Read(&rx_char) == 0) {
             last_rx_time = HAL_GetTick();
-            
-            // Dosya başlangıcını yakala (':')
             if (!file_started && rx_char == ':') {
                 file_started = 1;
                 printf("[Start] Veri akisi basladi...\r\n");
             }
-
             if (file_started) {
-                if (g_ram_idx < RAM_FILE_BUFFER_SIZE) {
-                    g_ram_buffer[g_ram_idx++] = rx_char;
-                } else {
-                    printf(CLR_RED "\r\n[HATA] RAM Buffer Doldu!\r\n" CLR_RESET);
-                    goto EXIT_BUFFERED;
-                }
+                if (g_ram_idx < RAM_FILE_BUFFER_SIZE) g_ram_buffer[g_ram_idx++] = rx_char;
+                else { printf(CLR_RED "\r\n[HATA] RAM Buffer Doldu!\r\n" CLR_RESET); goto EXIT_BUFFERED; }
             }
-        }
-        else
-        {
-            // Veri kesilirse (1.0 saniye bekleme)
+        } else {
             if (file_started && (HAL_GetTick() - last_rx_time > 1000)) {
                 printf("\r\n[INFO] Transfer bitti. RAM: %lu bytes.\r\n", g_ram_idx);
                 break;
@@ -216,18 +204,15 @@ void Receive_Raw_Hex_File(void)
     }
 
     if (g_ram_idx == 0) {
-        printf(CLR_RED "\r\n[HATA] Veri gelmedi.\r\n" CLR_RESET);
-        goto EXIT_BUFFERED;
+        printf(CLR_RED "\r\n[HATA] Veri gelmedi.\r\n" CLR_RESET); goto EXIT_BUFFERED;
     }
 
-    /* --- FLASH YAZMA DÖNGÜSÜ --- */
-    HAL_UART_AbortReceive(&huart3); // Interruptları kapat
+    /* --- FLASH YAZMA BASLIYOR --- */
+    HAL_UART_AbortReceive(&huart3);
     
-    // Cache devre dışı (Yazma hatasını önlemek için)
     HAL_ICACHE_Disable();
     HAL_DCACHE_Disable();
     
-    // Flash Kilidini Aç
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
@@ -240,63 +225,31 @@ void Receive_Raw_Hex_File(void)
     for (uint32_t i = 0; i < g_ram_idx; i++)
     {
         char c = g_ram_buffer[i];
-
-        if (c == ':') {
-            line_idx = 0; line_buffer[line_idx++] = ':'; continue;
-        }
+        if (c == ':') { line_idx = 0; line_buffer[line_idx++] = ':'; continue; }
 
         if (c == '\n' || c == '\r') {
             if (line_idx > 0) { 
                 line_buffer[line_idx] = '\0';
-                
                 if (line_buffer[0] == ':') {
-                    // HEX SATIR ÇÖZÜMLEME
                     uint8_t count = ParseByte(&line_buffer[1]);
                     uint16_t alow = (ParseByte(&line_buffer[3]) << 8) | ParseByte(&line_buffer[5]);
                     uint8_t type  = ParseByte(&line_buffer[7]);
 
-                    // TYPE 04: Üst Adres (Extended Linear Address)
-                    if (type == 0x04) {
+                    if (type == 0x04) { // Adres Guncelleme
                         uint16_t upper_val = (ParseByte(&line_buffer[9]) << 8) | ParseByte(&line_buffer[11]);
-                        
-                        /* --- FİLTRELEME MANTIĞI --- */
-                        /* Eğer adres 0x08xx (Flash) ise güncelle.
-                           Eğer RAM adresi (0x2000 vb) gelirse, varsayılan (0x0801/0x0820) kalsın. */
-                        if ((upper_val & 0xFF00) == 0x0800) {
-                            hex_upper_addr = upper_val;
-                            // printf(" > Adres Guncellendi: 0x%04X....\r\n", hex_upper_addr);
-                        } else {
-                            // Flash dışı adres (RAM vb.) -> Değiştirme, varsayılanı koru.
-                            // Böylece o veri yanlış adrese yazılmaz, aşağıdaki kontrolde elenir veya 
-                            // doğru flash bloğuna denk geliyorsa yazılır (RAM init verisi Flash'a yazılmaz).
-                            
-                            // Debug için: 
-                            // printf(" > RAM Segmenti Atlandi: 0x%04X\r\n", upper_val);
-                        }
+                        if ((upper_val & 0xFF00) == 0x0800) hex_upper_addr = upper_val;
                     }
-                    // TYPE 00: Data
-                    else if (type == 0x00) {
+                    else if (type == 0x00) { // Data
                         uint32_t current_addr = (hex_upper_addr << 16) | alow;
-
-                        /* --- YAZMA KONTROLÜ --- */
-                        // Sadece geçerli Flash adreslerine (0x08xxxxxx) yaz.
-                        if ((current_addr & 0xFF000000) == 0x08000000) 
-                        {
+                        if ((current_addr & 0xFF000000) == 0x08000000) {
                             uint8_t range_check = Check_Hex_Address_Range(current_addr, target_slot);
-                            
-                            // Slot veya Ortak Alan kontrolü
                             if (range_check == 1 || range_check == 2) { 
                                 for(int k=0; k<count; k++) {
                                     Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
                                 }
                                 written_byte_count += count;
-                            } else {
-                                skipped_byte_count += count;
-                            }
-                        } else {
-                            // RAM veya geçersiz bölge verisi -> Sessizce atla
-                            skipped_byte_count += count;
-                        }
+                            } else skipped_byte_count += count;
+                        } else skipped_byte_count += count;
                     }
                 }
                 line_idx = 0; 
@@ -305,17 +258,17 @@ void Receive_Raw_Hex_File(void)
         else if (line_idx < 511) line_buffer[line_idx++] = c;
     }
 
-    Flush_Smart_Buffer(); // Kalan son paketleri yaz
+    Flush_Smart_Buffer(); // Kalan son paketi yaz
 
     HAL_FLASH_Lock();
     HAL_ICACHE_Enable();
     HAL_DCACHE_Enable();
 
     printf("\r\n--------------------------------------\r\n");
-    printf("Yazilan: %lu bytes | Atlanan (RAM/Diger): %lu bytes\r\n", written_byte_count, skipped_byte_count);
+    printf("Yazilan: %lu bytes | Atlanan: %lu bytes\r\n", written_byte_count, skipped_byte_count);
 
     if (written_byte_count == 0) {
-        printf(CLR_RED "[HATA] Flash'a hic veri yazilmadi! (Header kacirildi ve varsayilan da ise yaramadi)\r\n" CLR_RESET);
+        printf(CLR_RED "[HATA] Hicbir veri yazilmadi! (Donanim hatasi devam ediyor)\r\n" CLR_RESET);
         goto EXIT_BUFFERED;
     }
 
@@ -333,8 +286,4 @@ EXIT_BUFFERED:
     HAL_DCACHE_Enable();
     printf("\r\n[FAIL] Islem Basarisiz.\r\n");
 }
-
-/* XMODEM fonksiyonu (Aynen Kalabilir, kullanılmıyor) */
-void Xmodem_Receive_Hex_File(void) {
-    printf("[XMODEM] Bu surumde pasif.\r\n");
-}
+void Xmodem_Receive_Hex_File(void) { printf("[INFO] RAW Mode aktif.\r\n"); }
