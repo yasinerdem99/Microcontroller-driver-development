@@ -1,0 +1,102 @@
+#include "Bootloader_flash.h"
+#include <string.h>
+#include <stdio.h>
+
+/* STM32U5A9 (4MB Device) için Bank 2 Başlangıcı */
+#define FLASH_BANK2_START_ADDR  0x08200000
+#define APP_NUM_PAGES_TO_ERASE  128  // 128 Sayfa x 8KB = 1MB Yer Açar
+
+/**
+  * @brief  Flash belleğe veri yazar (DEBUG & ALIGNMENT FIX).
+  */
+/**
+  * @brief  Flash belleğe veri yazar (PAD 0xFF FIX).
+  */
+uint8_t Bootloader_Flash_Write(uint32_t address, uint8_t *data, uint16_t len)
+{
+    /* 16 Byte'lık hizalı geçici buffer */
+    uint32_t temp_data[4];
+    uint8_t *temp_byte_ptr = (uint8_t*)temp_data;
+
+    /* Hata Bayraklarını Temizle */
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+    HAL_FLASH_Unlock();
+
+    /* Döngü 16'şar byte ilerler */
+    for (int i = 0; i < len; i += 16)
+    {
+        /* 1. Buffer'ı tamamen 0xFF ile doldur (Temizlik) */
+        /* Bu çok önemli! Eğer gelen veri 16 byte'tan azsa, kalanı FF olmalı. */
+        memset(temp_data, 0xFF, 16);
+
+        /* 2. Elimizdeki kadar veriyi kopyala */
+        /* Eğer kalan veri 16'dan azsa sadece onu kopyalar */
+        uint16_t copy_len = (len - i) >= 16 ? 16 : (len - i);
+        memcpy(temp_byte_ptr, &data[i], copy_len);
+
+        /* 3. Kesmeleri Kapat ve Yaz */
+        __disable_irq();
+        HAL_StatusTypeDef status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address + i, (uint32_t)temp_data);
+        __enable_irq();
+
+        /* Hata Kontrolü */
+        if (status != HAL_OK)
+        {
+            uint32_t error_code = HAL_FLASH_GetError();
+            HAL_FLASH_Lock();
+            printf("\r\n[HATA] Yazma Hatasi! Adr: 0x%08lX Err: 0x%X\r\n", address + i, (unsigned int)error_code);
+            return 0;
+        }
+    }
+
+    HAL_FLASH_Lock();
+    return 1;
+}
+
+/**
+  * @brief  Hedef slota ait sayfaları siler.
+  */
+uint8_t Bootloader_Flash_Erase_Target_Slot(uint32_t slot_addr)
+{
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    uint32_t StartPage;
+    uint32_t BankNumber;
+
+    /* Bank ve Sayfa Tespiti */
+    if (slot_addr < FLASH_BANK2_START_ADDR)
+    {
+        // --- BANK 1 ---
+        BankNumber = FLASH_BANK_1;
+        StartPage = (slot_addr - FLASH_BASE) / FLASH_PAGE_SIZE;
+        printf("[BILGI] Siliniyor: BANK 1, Page %lu\r\n", StartPage);
+    }
+    else
+    {
+        // --- BANK 2 ---
+        BankNumber = FLASH_BANK_2;
+        // Bank 2 Offset Hesabı (Adres - 0x08200000)
+        StartPage = (slot_addr - FLASH_BANK2_START_ADDR) / FLASH_PAGE_SIZE;
+        printf("[BILGI] Siliniyor: BANK 2, Page %lu\r\n", StartPage);
+    }
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS); // Silmeden önce de temizle
+
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = BankNumber;
+    EraseInitStruct.Page        = StartPage;
+    EraseInitStruct.NbPages     = APP_NUM_PAGES_TO_ERASE;
+
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        printf("[HATA] Silme Basarisiz! PageError: %lu\r\n", PageError);
+        return 0;
+    }
+
+    HAL_FLASH_Lock();
+    printf("[BILGI] Silme Tamamlandi.\r\n");
+    return 1;
+}
