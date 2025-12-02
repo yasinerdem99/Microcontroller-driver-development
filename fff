@@ -1,30 +1,6 @@
-    /* ... Önceki kodlar aynı ... */
-
+    /* Ring Buffer'da kalan artık karakterleri (Enter tuşu vb.) temizle */
+    uint8_t dummy;
+    while(Ring_Buffer_Read(&dummy) == 0); // Havuz boşalana kadar oku
+    file_started = 0; // Bayrağı sıfırla
+    
     printf("Simdi dosyayi surukleyin... (Bekleniyor)\r\n");
-
-    /* INTERRUPT BAŞLAT */
-    HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
-    last_rx_time = HAL_GetTick();
-
-    while(1)
-    {
-        /* Havuzdan Veri Çek */
-        if (Ring_Buffer_Read(&rx_char) == 0) 
-        {
-            last_rx_time = HAL_GetTick();
-            
-            /* --- KRİTİK DÜZELTME BURADA --- */
-            /* Dosya transferi sadece ':' (iki nokta) görünce başlamış sayılsın. */
-            /* Böylece 'Enter' tuşundan kalan \n karakterleri sayacı tetiklemez. */
-            if (rx_char == ':') {
-                file_started = 1; 
-            }
-            /* ------------------------------ */
-
-            if (rx_char == ':') {
-                line_idx = 0;
-                line_buffer[line_idx++] = ':'; 
-                continue; 
-            }
-            
-            /* ... Kodun geri kalanı aynı ... */
