@@ -1,7 +1,6 @@
 /*
  * Bootloader_hex.c
- * ULTIMATE VERSION: DMA + CIRCULAR BUFFER
- * (Sürükle Bırak İçin En Sağlam Yöntem - GPDMA Destekli)
+ * ULTIMATE FIX: DMA + D-CACHE MANAGEMENT
  */
 
 #include "Bootloader_hex.h"
@@ -12,11 +11,6 @@
 
 extern UART_HandleTypeDef huart3;
 
-/* DMA COUNTER MAKROSU (STM32U5 GPDMA İçin) */
-/* U5 serisinde __HAL_DMA_GET_COUNTER bazen farklı çalışabilir.
-   En garantisi linked list kullanmıyorsak standart makrodur. */
-#define GET_DMA_COUNTER(handle) __HAL_DMA_GET_COUNTER(handle)
-
 #define SOH 0x01
 #define EOT 0x04
 #define ACK 0x06
@@ -24,14 +18,13 @@ extern UART_HandleTypeDef huart3;
 #define CAN 0x18
 #define CHAR_C 'C'
 
-/* --- DMA BUFFER AYARLARI --- */
-#define DMA_RX_BUFFER_SIZE  16384  // 16KB DMA Tamponu (Büyük tutalim)
-/* Buffer'ı belirli bir bölgeye (SRAM1) koymak iyi olabilir ama 
-   U5'te otomatik yerleşim de çalışır. */
-static uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE];
+/* --- DMA BUFFER --- */
+#define DMA_RX_BUFFER_SIZE  16384  // 16KB
+/* D-Cache uyumluluğu için buffer'ı 32-byte hizalamak iyi olur (Opsiyonel) */
+static uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE] __attribute__((aligned(32)));
 static uint32_t rb_tail = 0;
 
-/* Parsing Değişkenleri */
+/* Değişkenler */
 static uint32_t hex_upper_addr = 0;
 static uint8_t  smart_buffer[16];       
 static uint32_t smart_base_addr = 0xFFFFFFFF; 
@@ -41,28 +34,30 @@ static uint8_t  smart_dirty = 0;
 /* YARDIMCI FONKSİYONLAR                                        */
 /* ============================================================ */
 
-/* DMA'dan Veri Okuma Motoru */
-/* Bu fonksiyon, DMA'nın doldurduğu ama bizim henüz okumadığımız
-   verileri "tail" indeksini kullanarak çeker. */
+/* STM32U5 GPDMA Sayacını Okuma */
+static uint32_t Get_DMA_Counter(void)
+{
+    /* U5 serisinde GPDMA kullanılıyorsa standart makro çalışmayabilir.
+       Genellikle bu makro U5 HAL kütüphanesinde CBR1 registerını okur. */
+    return __HAL_DMA_GET_COUNTER(huart3.hdmarx);
+}
+
 static int DMA_Read_Byte(uint8_t *byte)
 {
-    /* DMA sayacı azalarak gider (Size -> 0) */
-    /* huart3.hdmarx -> UART'ın bağlı olduğu DMA kanalı */
-    uint32_t dma_counter = GET_DMA_COUNTER(huart3.hdmarx);
-    
-    /* Head pozisyonunu hesapla (Yazılan son yer) */
+    uint32_t dma_counter = Get_DMA_Counter();
     uint32_t rb_head = DMA_RX_BUFFER_SIZE - dma_counter;
 
-    /* Eğer kuyruk başı yakaladıysa veri yok demektir */
     if (rb_tail == rb_head) {
-        return -1; // Okunacak yeni veri yok
+        return -1; // Veri yok
     }
 
-    /* Veriyi al ve kuyruğu ilerlet */
+    /* Cache Koruması: Okumadan önce bu bölgeyi Cache'ten sil (Invalidate) */
+    /* Tek tek yapmak yavaşlatabilir, o yüzden Ana Fonksiyonda Cache'i komple kapatacağız. */
+    
     *byte = dma_rx_buffer[rb_tail];
     rb_tail = (rb_tail + 1) % DMA_RX_BUFFER_SIZE;
 
-    return 0; // Veri okundu
+    return 0;
 }
 
 static uint8_t HexCharToByte(char c) {
@@ -131,16 +126,16 @@ static uint8_t Check_Hex_Address_Range(uint32_t addr, uint32_t target_slot) {
 }
 
 /* ============================================================ */
-/* XMODEM FONKSİYONU (Standart - Dokunulmadi)                   */
+/* XMODEM FONKSİYONU                                            */
 /* ============================================================ */
 void Xmodem_Receive_Hex_File(void)
 {
-    /* XMODEM kodunu buraya olduğu gibi yapıştır (Eski kodundan al) */
-    /* DMA ile çakışmaz çünkü burada DMA başlatmıyoruz */
+    /* XMODEM Kodun Burada Kalacak */
+    /* ... */
 }
 
 /* ============================================================ */
-/* RAW HEX YUKLEME (DMA Destekli - 0ms Gecikme)                 */
+/* RAW HEX YUKLEME (DMA + CACHE FIX)                            */
 /* ============================================================ */
 void Receive_Raw_Hex_File(void)
 {
@@ -153,7 +148,6 @@ void Receive_Raw_Hex_File(void)
     uint32_t current_addr = 0; 
     uint32_t target_slot = 0;
     uint8_t is_flash_erased = 0; 
-    uint32_t byte_counter = 0;
     
     char sub_cmd[10];
     uint8_t success_flag = 0;
@@ -161,12 +155,10 @@ void Receive_Raw_Hex_File(void)
     /* Reset */
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
-    
-    /* DMA Tail Reset */
     rb_tail = 0;
 
     /* --- HEDEF SEÇİMİ --- */
-    printf("\r\n" "\033[1;96m" "[RAW DMA]" "\033[0m" " Slot Secimi (a/b) > ");
+    printf("\r\n[RAW DMA] Slot Secimi (a/b) > ");
     fflush(stdout);
     Hex_Read_Line(sub_cmd, 10);
 
@@ -174,11 +166,20 @@ void Receive_Raw_Hex_File(void)
     else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) target_slot = SLOT_B_ADDR;
     else { printf("\r\nIptal.\r\n"); return; }
 
+    /* --- KRİTİK ADIM: D-CACHE KAPAT --- */
+    /* DMA RAM'e yazarken CPU'nun eski veriyi okumasını engeller. */
+    /* Fonksiyon sonunda tekrar açacağız. */
+    SCB_DisableDCache(); 
+    printf("[SYS] D-Cache Gecici Olarak Kapatildi.\r\n");
+
     printf("\r\nHazir. Dosyayi surukleyin... (DMA Modu)\r\n");
 
-    /* --- DMA BAŞLAT (CIRCULAR MODE) --- */
-    /* Bu komut, UART'tan gelen verileri arka planda sonsuz döngüde tampona atar */
-    HAL_UART_Receive_DMA(&huart3, dma_rx_buffer, DMA_RX_BUFFER_SIZE);
+    /* --- DMA BAŞLAT --- */
+    if (HAL_UART_Receive_DMA(&huart3, dma_rx_buffer, DMA_RX_BUFFER_SIZE) != HAL_OK) {
+        printf("\r\n[KRITIK HATA] DMA Baslatilamadi!\r\n");
+        SCB_EnableDCache();
+        return;
+    }
     
     last_rx_time = HAL_GetTick();
 
@@ -188,12 +189,12 @@ void Receive_Raw_Hex_File(void)
         if (DMA_Read_Byte(&rx_char) == 0) 
         {
             last_rx_time = HAL_GetTick();
-            file_started = 1;
-
+            
             if (rx_char == ':') {
+                file_started = 1;
                 line_idx = 0;
-                line_buffer[line_idx++] = ':'; 
-                continue; 
+                line_buffer[line_idx++] = ':';
+                continue;
             }
 
             if ((rx_char == '\n' || rx_char == '\r') && line_idx > 0) 
@@ -205,13 +206,8 @@ void Receive_Raw_Hex_File(void)
                     uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
                     uint8_t type  = ParseByte(&line_buffer[7]);
                     
-                    if (type == 0x04) { 
-                        hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]);
-                    }
-                    else if (type == 0x00) { 
+                    if (type == 0x00) { // DATA
                         current_addr = (hex_upper_addr << 16) | alow;
-                        
-                        /* FİLTRE: Geçersiz adresleri yoksay */
                         if (current_addr < 0x08000000) { line_idx = 0; continue; }
 
                         if (is_flash_erased == 0) {
@@ -229,50 +225,42 @@ void Receive_Raw_Hex_File(void)
                         for(int k=0; k<count; k++) {
                             Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
                         }
-                        
-                        byte_counter += count;
-                        if(byte_counter % 2048 == 0) { printf("."); fflush(stdout); }
                     }
-                    else if (type == 0x01) { 
-                        success_flag = 1;
-                        goto EXIT_TRANSFER;
-                    }
+                    else if (type == 0x01) { success_flag = 1; goto EXIT_TRANSFER; }
+                    else if (type == 0x04) { hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]); }
                 }
                 line_idx = 0;
             } 
             else {
-                /* Karakter Filtreleme */
-                if(line_idx < 511) {
-                    if ((rx_char >= '0' && rx_char <= '9') || 
-                        (rx_char >= 'A' && rx_char <= 'F') || 
-                        (rx_char >= 'a' && rx_char <= 'f') || 
-                        rx_char == ':') 
-                    {
-                        line_buffer[line_idx++] = rx_char;
-                    }
-                }
+                if(line_idx < 511) line_buffer[line_idx++] = rx_char;
             }
         }
         else {
-            /* Timeout: 3 sn veri gelmezse */
+            /* Timeout: 3 sn */
             if (file_started && (HAL_GetTick() - last_rx_time > 3000)) {
-                if(is_flash_erased) success_flag = 1; // Tolerans
-                else printf("\r\n[TIMEOUT] Veri gelmedi.\r\n");
+                if(is_flash_erased) success_flag = 1;
+                else {
+                    /* DEBUG: DMA Durumunu Bas */
+                    uint32_t cnt = Get_DMA_Counter();
+                    uint32_t head = DMA_RX_BUFFER_SIZE - cnt;
+                    printf("\r\n[TIMEOUT] DMA Head: %lu, Tail: %lu\r\n", head, rb_tail);
+                }
                 goto EXIT_TRANSFER;
             }
         }
     }
 
 EXIT_TRANSFER:
-    /* DMA DURDUR */
+    /* DMA DURDUR VE CACHE AÇ */
     HAL_UART_DMAStop(&huart3);
+    SCB_EnableDCache();
     
     Flush_Smart_Buffer(); 
     
     if (success_flag) {
         if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
         else Set_Active_Slot(SLOT_A_ACTIVE);
-        printf("\r\n\n[OK] RAW Yukleme Tamamlandi! (%lu Bytes)\r\n", byte_counter);
+        printf("\r\n\n[OK] RAW Yukleme Tamamlandi!\r\n");
     } else {
         printf("\r\n[FAIL] Yukleme tamamlanamadi!\r\n");
     }
