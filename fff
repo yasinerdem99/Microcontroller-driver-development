@@ -1,36 +1,28 @@
-/* ============================================================ */
-/* PLAN B: RAW BUFFERED (RAM'e Al -> Sonra Flash'a Yaz)         */
-/* ============================================================ */
-
-/* * DİKKAT: Bu boyut işlemcinizin RAM kapasitesine göre ayarlanmalıdır.
- * STM32F4/F7 gibi modellerde 48000 (48KB) rahatça çalışır.
- * Küçük modellerde (F103 vb.) bunu 10000-20000'e düşürün.
- */
-#define RAM_FILE_BUFFER_SIZE  48000 
+#define RAM_FILE_BUFFER_SIZE  48000
 static uint8_t g_ram_buffer[RAM_FILE_BUFFER_SIZE];
 static uint32_t g_ram_idx = 0;
 
-void Receive_Raw_Hex_File_Buffered(void)
+void Receive_Raw_Hex_File(void)
 {
     uint8_t rx_char;
-    uint32_t last_rx_time = 0; 
+    uint32_t last_rx_time = 0;
     uint8_t file_started = 0;
     uint32_t target_slot = 0;
     char sub_cmd[10];
-    
+
     // Parsing değişkenleri
-    char line_buffer[512]; 
+    char line_buffer[512];
     uint16_t line_idx = 0;
     uint32_t current_addr = 0;
-    uint8_t is_flash_erased = 0; 
+    uint8_t is_flash_erased = 0;
 
     /* Temizlik */
     g_ram_idx = 0;
     hex_upper_addr = 0;
-    smart_base_addr = 0xFFFFFFFF; 
-    smart_dirty = 0; 
+    smart_base_addr = 0xFFFFFFFF;
+    smart_dirty = 0;
     memset(smart_buffer, 0xFF, 16);
-    rb_head = 0; rb_tail = 0; 
+    rb_head = 0; rb_tail = 0;
 
     /* --- ADIM 1: HEDEF SEÇİMİ --- */
     printf("\r\n" CLR_CYAN "[PLAN B: RAM BUFFER]" CLR_RESET " Slot Secimi (a/b) > ");
@@ -43,7 +35,7 @@ void Receive_Raw_Hex_File_Buffered(void)
 
     /* --- ADIM 2: SADECE VERİ TOPLAMA (YAZMA YOK) --- */
     printf("\r\nDosyayi simdi surukleyin... (RAM'e kaydediliyor)\r\n");
-    
+
     // Havuzu temizle ve başlat
     __HAL_UART_CLEAR_OREFLAG(&huart3);
     HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
@@ -52,7 +44,7 @@ void Receive_Raw_Hex_File_Buffered(void)
     while(1)
     {
         // Ring Buffer'dan oku
-        if (Ring_Buffer_Read(&rx_char) == 0) 
+        if (Ring_Buffer_Read(&rx_char) == 0)
         {
             last_rx_time = HAL_GetTick();
 
@@ -72,7 +64,7 @@ void Receive_Raw_Hex_File_Buffered(void)
                 }
             }
         }
-        else 
+        else
         {
             // Timeout kontrolü (Dosya bittiyse akış durur)
             if (file_started && (HAL_GetTick() - last_rx_time > 1500)) {
@@ -97,9 +89,9 @@ void Receive_Raw_Hex_File_Buffered(void)
     printf("[OK]\r\nRAM verisi Flash'a isleniyor... "); fflush(stdout);
 
     is_flash_erased = 1; // Zaten sildik
-    
+
     // RAM'deki veriyi sanki UART'tan geliyormuş gibi byte byte işle
-    for (uint32_t i = 0; i < g_ram_idx; i++) 
+    for (uint32_t i = 0; i < g_ram_idx; i++)
     {
         char c = g_ram_buffer[i];
 
@@ -113,7 +105,7 @@ void Receive_Raw_Hex_File_Buffered(void)
         if (c == '\n' || c == '\r') {
             if (line_idx > 0) {
                 line_buffer[line_idx] = '\0';
-                
+
                 if (line_buffer[0] == ':') {
                     uint8_t count = ParseByte(&line_buffer[1]);
                     uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
@@ -146,7 +138,7 @@ void Receive_Raw_Hex_File_Buffered(void)
 
     if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
     else Set_Active_Slot(SLOT_A_ACTIVE);
-    
+
     printf("\r\n" CLR_GREEN "[BASARILI] B Plani Tamamlandi!" CLR_RESET "\r\n");
     return;
 
