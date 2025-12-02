@@ -1,151 +1,12 @@
 /*
- * Bootloader_hex.c
- * PROFESSIONAL VERSION: Fault-Tolerant Ring Buffer
+ * RAW HEX YUKLEME (Filter Logic Fix)
  */
-
-#include "Bootloader_hex.h"
-#include "Bootloader_flash.h"
-#include "Bootloader_config.h" 
-#include <stdio.h>
-#include <string.h>
-
-extern UART_HandleTypeDef huart3;
-
-/* --- AYARLAR --- */
-#define RING_BUFFER_SIZE  32768  // 32KB Devasa Tampon (Veri kaçırmamak için şart)
-#define RAW_TIMEOUT       5000   // 5 Saniye Timeout
-
-/* --- GLOBAL DEĞİŞKENLER --- */
-static uint8_t  rb_data[RING_BUFFER_SIZE];
-static volatile uint16_t rb_head = 0;
-static volatile uint16_t rb_tail = 0;
-static uint8_t  rx_byte_it; 
-
-static uint32_t hex_upper_addr = 0;
-static uint8_t  smart_buffer[16];       
-static uint32_t smart_base_addr = 0xFFFFFFFF; 
-static uint8_t  smart_dirty = 0;        
-
-/* ============================================================ */
-/* 1. KESME (INTERRUPT) YÖNETİMİ - KALBİN ATTIĞI YER            */
-/* ============================================================ */
-
-/* Veri Geldiğinde (Normal Durum) */
-void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART3) {
-        // Veriyi havuza at
-        rb_data[rb_head] = rx_byte_it;
-        // Head'i ilerlet (Döngüsel)
-        rb_head = (rb_head + 1) % RING_BUFFER_SIZE;
-        
-        // Tekrar dinlemeye geç (Zinciri koparma)
-        HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
-    }
-}
-
-/* HATA OLDUĞUNDA (Overrun, Noise vs.) - HAYAT KURTARAN KISIM */
-void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
-    if (huart->Instance == USART3) {
-        // Hata ne olursa olsun (Overrun dahil), alımı ASLA durdurma.
-        // Hata bayrakları HAL tarafından temizlenir, biz sadece yeniden başlatıyoruz.
-        HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
-    }
-}
-
-/* ============================================================ */
-/* 2. YARDIMCI FONKSİYONLAR                                     */
-/* ============================================================ */
-
-static int Ring_Buffer_Read(uint8_t *byte) {
-    if (rb_head == rb_tail) return -1; // Havuz boş
-    *byte = rb_data[rb_tail];
-    rb_tail = (rb_tail + 1) % RING_BUFFER_SIZE;
-    return 0; 
-}
-
-static uint8_t ParseByte(char* ptr) {
-    uint8_t res = 0;
-    for(int i=0; i<2; i++) {
-        char c = ptr[i];
-        uint8_t val = 0;
-        if (c >= '0' && c <= '9') val = c - '0';
-        else if (c >= 'A' && c <= 'F') val = c - 'A' + 10;
-        else if (c >= 'a' && c <= 'f') val = c - 'a' + 10;
-        
-        if (i==0) res = val << 4;
-        else res |= val;
-    }
-    return res;
-}
-
-static uint16_t Calc_CRC16_Hex(const uint8_t *data, uint16_t size) {
-    uint16_t crc = 0;
-    while (size--) {
-        crc ^= (*data++) << 8;
-        for (int i = 0; i < 8; i++) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021; else crc = crc << 1;
-        }
-    }
-    return crc;
-}
-
-static void Hex_Read_Line(char *buffer, uint16_t max_len) {
-    uint16_t index = 0; uint8_t rx_char; memset(buffer, 0, max_len);
-    while(1) {
-        if (HAL_UART_Receive(&huart3, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
-            if (rx_char == '\r' || rx_char == '\n') { buffer[index] = 0; return; }
-            if (index < max_len - 1) buffer[index++] = rx_char;
-        }
-    }
-}
-
-static void Flush_Smart_Buffer(void) {
-    if (smart_dirty && smart_base_addr != 0xFFFFFFFF) {
-        // Flash yazma fonksiyonu interrupt kapatmamalı!
-        if (Bootloader_Flash_Write(smart_base_addr, smart_buffer, 16) == 0) 
-            printf("\r\n[HATA] Yazma Basarisiz: 0x%08lX\r\n", smart_base_addr);
-        smart_dirty = 0; 
-    }
-}
-
-static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
-    uint32_t aligned_base = addr & 0xFFFFFFF0;
-    uint8_t offset = addr & 0x0F;
-    if (aligned_base != smart_base_addr) {
-        Flush_Smart_Buffer(); 
-        memset(smart_buffer, 0xFF, 16); 
-        smart_base_addr = aligned_base;
-        smart_dirty = 0;
-    }
-    smart_buffer[offset] = byte;
-    smart_dirty = 1; 
-}
-
-static uint8_t Check_Hex_Address_Range(uint32_t addr, uint32_t target_slot) {
-    if (addr >= 0x08000000 && addr < 0x08010000) return 2;
-    if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
-    if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
-    return 0;
-}
-
-/* ============================================================ */
-/* 3. ANA FONKSIYON: XMODEM (Standard)                          */
-/* ============================================================ */
-void Xmodem_Receive_Hex_File(void)
-{
-    /* ... (XMODEM kodun buraya gelecek, eski kodunu koru) ... */
-    /* Kod kalabalığı olmasın diye burayı kısa tutuyorum, eski XMODEM kodunu buraya koy */
-    /* Sadece Receive_Raw_Hex_File kısmına odaklanıyoruz */
-}
-
-/* ============================================================ */
-/* 4. ANA FONKSIYON: RAW HEX (Sürükle-Bırak)                    */
-/* ============================================================ */
 void Receive_Raw_Hex_File(void)
 {
     char line_buffer[512]; 
     uint16_t line_idx = 0; 
     uint8_t rx_char;
+    
     uint32_t last_rx_time = 0; 
     uint8_t file_started = 0;
     
@@ -157,117 +18,126 @@ void Receive_Raw_Hex_File(void)
     char sub_cmd[10];
     uint8_t success_flag = 0;
 
-    /* Reset */
+    /* Değişkenleri Sıfırla */
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
     rb_head = 0; rb_tail = 0; 
 
-    printf("\r\n[RAW MODU] Slot Secimi (a/b) > "); fflush(stdout);
+    /* --- HEDEF SEÇİMİ --- */
+    printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
+    fflush(stdout);
     Hex_Read_Line(sub_cmd, 10);
 
-    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) target_slot = SLOT_A_ADDR;
-    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) target_slot = SLOT_B_ADDR;
-    else { printf("\r\nIptal.\r\n"); return; }
+    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
+        target_slot = SLOT_A_ADDR;
+        printf("HEDEF: SLOT A\r\n");
+    }
+    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
+        target_slot = SLOT_B_ADDR;
+        printf("HEDEF: SLOT B\r\n");
+    }
+    else { 
+        printf("\r\nIptal.\r\n"); return; 
+    }
 
-    printf("\r\n[HAZIR] Dosyayi surukleyin... (Bekleniyor)\r\n");
+    printf("\r\nHazir. Dosyayi surukleyin... (Bekleniyor)\r\n");
 
-    /* MOTORU ÇALIŞTIR */
-    /* İlk kesmeyi başlatıyoruz */
+    /* INTERRUPT BAŞLAT */
     HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
     last_rx_time = HAL_GetTick();
 
     while(1)
     {
-        /* Havuzdan veri çekmeye çalış */
+        /* Havuzdan Veri Çek */
         if (Ring_Buffer_Read(&rx_char) == 0) 
         {
             last_rx_time = HAL_GetTick();
-            
-            /* Gürültü Filtresi: Sadece geçerli karakterleri al */
-            /* HEX dosyası sadece şunları içerir: 0-9, A-F, :, \r, \n */
-            if ( (rx_char >= '0' && rx_char <= '9') || 
-                 (rx_char >= 'A' && rx_char <= 'F') ||
-                 (rx_char >= 'a' && rx_char <= 'f') ||
-                 rx_char == ':' || rx_char == '\r'  || rx_char == '\n')
-            {
-                /* OK, geçerli karakter */
-            } else {
-                /* Çöp karakter, yoksay ve döngüye devam et */
+            file_started = 1;
+
+            if (rx_char == ':') {
+                line_idx = 0;
+                line_buffer[line_idx++] = ':'; 
                 continue; 
             }
 
-            /* Senkronizasyon */
-            if (rx_char == ':') {
-                file_started = 1; // Dosya başladı
-                line_idx = 0;
-                line_buffer[line_idx++] = ':';
-                continue;
-            }
-
-            /* Satır Sonu */
-            if ((rx_char == '\n' || rx_char == '\r') && line_idx > 0) 
+            if (rx_char == '\n' || rx_char == '\r') 
             {
-                line_buffer[line_idx] = '\0';
-                
-                if (line_buffer[0] == ':') {
-                    uint8_t count = ParseByte(&line_buffer[1]);
-                    uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
-                    uint8_t type  = ParseByte(&line_buffer[7]);
+                if (line_idx > 0) {
+                    line_buffer[line_idx] = '\0';
                     
-                    /* Type 04: Adres */
-                    if (type == 0x04) { 
-                        hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]);
-                    }
-                    /* Type 00: Data */
-                    else if (type == 0x00) { 
-                        current_addr = (hex_upper_addr << 16) | alow;
+                    /* --- HEX PARSING --- */
+                    if (line_buffer[0] == ':') {
+                        uint8_t count = ParseByte(&line_buffer[1]);
+                        uint16_t alow = (ParseByte(&line_buffer[3])<<8)|ParseByte(&line_buffer[5]);
+                        uint8_t type  = ParseByte(&line_buffer[7]);
                         
-                        /* Flash Dışındaysa Atla (Filtre) */
-                        if (current_addr < 0x08000000) {
-                            line_idx = 0; continue;
-                        }
+                        /* --- BURASI DEĞİŞTİ: ÖNCE TİP KONTROLÜ, SONRA FİLTRE --- */
 
-                        /* İlk Silme */
-                        if (is_flash_erased == 0) {
-                            if (Check_Hex_Address_Range(current_addr, target_slot) != 1) {
-                                printf("\r\n[HATA] Adres Uyusmazligi! Dosya: 0x%08lX\r\n", current_addr);
-                                goto EXIT_TRANSFER;
-                            }
-                            printf("[INFO] Siliniyor... "); fflush(stdout);
-                            if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
-                                printf("[FAIL]\r\n"); goto EXIT_TRANSFER;
-                            }
-                            printf("[OK]\r\nYukleniyor"); fflush(stdout);
-                            is_flash_erased = 1;
+                        /* TYPE 04: EXTENDED LINEAR ADDRESS (Önce bunu işle!) */
+                        if (type == 0x04) { 
+                            hex_upper_addr = (ParseByte(&line_buffer[9])<<8)|ParseByte(&line_buffer[11]);
+                            // Adres güncellendi, veri yok, devam et.
                         }
                         
-                        /* Yaz */
-                        for(int k=0; k<count; k++) {
-                            Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
+                        /* TYPE 00: DATA KAYDI */
+                        else if (type == 0x00) { 
+                            current_addr = (hex_upper_addr << 16) | alow;
+                            
+                            /* FİLTRE: Sadece DATA satırlarını filtrele */
+                            if (current_addr < 0x08000000) {
+                                // Flash adresi değilse (0x0000...) bu satırı atla
+                                line_idx = 0; 
+                                continue; 
+                            }
+
+                            /* Güvenlik ve Silme */
+                            if (is_flash_erased == 0) {
+                                uint8_t check = Check_Hex_Address_Range(current_addr, target_slot);
+                                if (check != 1) { 
+                                    printf("\r\n[HATA] Adres Uyusmazligi! Dosya: 0x%08lX Hedef: 0x%08lX\r\n", current_addr, target_slot);
+                                    goto EXIT_TRANSFER; 
+                                }
+                                printf("[INFO] Adres Dogru. Siliniyor..."); fflush(stdout);
+                                if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+                                    printf("[FAIL]\r\n"); goto EXIT_TRANSFER;
+                                }
+                                printf("[OK]\r\nYukleniyor"); fflush(stdout);
+                                is_flash_erased = 1;
+                            }
+                            
+                            /* Yazma */
+                            for(int k=0; k<count; k++) {
+                                Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
+                            }
+                            
+                            byte_counter += count;
+                            if(byte_counter % 1024 == 0) { printf("."); fflush(stdout); }
                         }
-                        
-                        byte_counter += count;
-                        if(byte_counter % 2048 == 0) { printf("."); fflush(stdout); }
+                        /* TYPE 01: EOF */
+                        else if (type == 0x01) { 
+                            success_flag = 1;
+                            goto EXIT_TRANSFER;
+                        }
                     }
-                    /* Type 01: EOF */
-                    else if (type == 0x01) { 
-                        success_flag = 1;
-                        goto EXIT_TRANSFER;
-                    }
+                    line_idx = 0;
                 }
-                line_idx = 0;
             } 
             else {
-                if(line_idx < 511) line_buffer[line_idx++] = rx_char;
+                if(line_idx > 0 && line_idx < 511) {
+                    if ((rx_char >= '0' && rx_char <= '9') || 
+                        (rx_char >= 'A' && rx_char <= 'F') || 
+                        (rx_char >= 'a' && rx_char <= 'f')) 
+                    {
+                        line_buffer[line_idx++] = rx_char;
+                    }
+                }
             }
         }
         else {
-            /* Timeout Kontrolü */
-            if (file_started && (HAL_GetTick() - last_rx_time > RAW_TIMEOUT)) {
-                /* Eğer yazma başladıysa ve timeout olduysa BAŞARILI say */
+            /* Timeout: Dosya başladıysa ve 2 saniye ses yoksa bitir */
+            if (file_started && (HAL_GetTick() - last_rx_time > 2000)) {
                 if(is_flash_erased) success_flag = 1;
                 else printf("\r\n[TIMEOUT] Veri gelmedi.\r\n");
-                
                 goto EXIT_TRANSFER;
             }
         }
@@ -280,8 +150,8 @@ EXIT_TRANSFER:
     if (success_flag) {
         if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
         else Set_Active_Slot(SLOT_A_ACTIVE);
-        printf("\r\n\n[OK] RAW Yukleme Tamamlandi! (%lu Bytes)\r\n", byte_counter);
+        printf("\r\n\n" CLR_GREEN "[OK] RAW Yukleme Tamamlandi! (%lu Bytes)" CLR_RESET "\r\n", byte_counter);
     } else {
-        printf("\r\n[FAIL] Yukleme basarisiz.\r\n");
+        printf("\r\n" CLR_RED "[FAIL] Yukleme tamamlanamadi!" CLR_RESET "\r\n");
     }
 }
