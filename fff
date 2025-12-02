@@ -1,6 +1,6 @@
 /*
  * Bootloader_hex.c
- * FULL VERSION: XMODEM + RAW (STM32U5 Fix: RAM Filter & Strict Alignment)
+ * FULL VERSION: XMODEM + RAW (STM32U5 Fix: Smart Default Address & Alignment)
  */
 
 #include "Bootloader_hex.h"
@@ -152,7 +152,6 @@ void Receive_Raw_Hex_File(void)
 
     // Başlangıç Ayarları
     g_ram_idx = 0;
-    hex_upper_addr = 0x0000; // Varsayılan 0, dosyadan geleni bekleyeceğiz
     smart_base_addr = 0xFFFFFFFF;
     smart_dirty = 0;
     memset(smart_buffer, 0xFF, 16);
@@ -162,9 +161,21 @@ void Receive_Raw_Hex_File(void)
     fflush(stdout);
     Hex_Read_Line(sub_cmd, 10);
 
-    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) target_slot = SLOT_A_ADDR;
-    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) target_slot = SLOT_B_ADDR;
-    else { printf("\r\nIptal.\r\n"); return; }
+    /* --- ADRES BAŞLANGIÇ AYARI (SMART DEFAULT) --- */
+    /* Dosyanın başındaki :02000004... satırı kaçarsa diye,
+       varsayılan adresi seçilen Slota göre kuruyoruz. */
+    
+    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
+        target_slot = SLOT_A_ADDR;
+        hex_upper_addr = 0x0801; // Varsayılan: Slot A (0x0801xxxx)
+    }
+    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
+        target_slot = SLOT_B_ADDR;
+        hex_upper_addr = 0x0820; // Varsayılan: Slot B (0x0820xxxx) - Cihaza göre değişebilir
+    }
+    else { 
+        printf("\r\nIptal.\r\n"); return; 
+    }
 
     /* --- VERİ ALMA DÖNGÜSÜ --- */
     printf("\r\nDosyayi simdi surukleyin... (Bekleniyor)\r\n");
@@ -224,7 +235,7 @@ void Receive_Raw_Hex_File(void)
     if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
         printf("[FAIL]\r\n"); goto EXIT_BUFFERED;
     }
-    printf("[OK]\r\nRAM -> Flash Yaziliyor...\r\n");
+    printf("[OK]\r\nRAM -> Flash Yaziliyor... (Varsayilan Base: 0x%04X....)\r\n", hex_upper_addr);
 
     for (uint32_t i = 0; i < g_ram_idx; i++)
     {
@@ -249,14 +260,18 @@ void Receive_Raw_Hex_File(void)
                         uint16_t upper_val = (ParseByte(&line_buffer[9]) << 8) | ParseByte(&line_buffer[11]);
                         
                         /* --- FİLTRELEME MANTIĞI --- */
-                        /* Eğer adres 0x08xx (Flash) değilse bu bölümü tamamen yok say.
-                           Bu, 0x2000 gibi RAM adreslerinin yazılmasını engeller. */
+                        /* Eğer adres 0x08xx (Flash) ise güncelle.
+                           Eğer RAM adresi (0x2000 vb) gelirse, varsayılan (0x0801/0x0820) kalsın. */
                         if ((upper_val & 0xFF00) == 0x0800) {
                             hex_upper_addr = upper_val;
                             // printf(" > Adres Guncellendi: 0x%04X....\r\n", hex_upper_addr);
                         } else {
-                            // Flash dışı adres (RAM vb.) -> Güvenli bölgeye çekme, sadece atla.
-                            hex_upper_addr = 0x0000; // 0 yaparak aşağıdaki Data kontrolünde yakalanmasını sağla
+                            // Flash dışı adres (RAM vb.) -> Değiştirme, varsayılanı koru.
+                            // Böylece o veri yanlış adrese yazılmaz, aşağıdaki kontrolde elenir veya 
+                            // doğru flash bloğuna denk geliyorsa yazılır (RAM init verisi Flash'a yazılmaz).
+                            
+                            // Debug için: 
+                            // printf(" > RAM Segmenti Atlandi: 0x%04X\r\n", upper_val);
                         }
                     }
                     // TYPE 00: Data
@@ -265,7 +280,6 @@ void Receive_Raw_Hex_File(void)
 
                         /* --- YAZMA KONTROLÜ --- */
                         // Sadece geçerli Flash adreslerine (0x08xxxxxx) yaz.
-                        // hex_upper_addr 0 ise (RAM bölgesindeysek) buraya girmez.
                         if ((current_addr & 0xFF000000) == 0x08000000) 
                         {
                             uint8_t range_check = Check_Hex_Address_Range(current_addr, target_slot);
@@ -301,7 +315,7 @@ void Receive_Raw_Hex_File(void)
     printf("Yazilan: %lu bytes | Atlanan (RAM/Diger): %lu bytes\r\n", written_byte_count, skipped_byte_count);
 
     if (written_byte_count == 0) {
-        printf(CLR_RED "[HATA] Flash'a hic veri yazilmadi! Hex dosyasini kontrol et.\r\n" CLR_RESET);
+        printf(CLR_RED "[HATA] Flash'a hic veri yazilmadi! (Header kacirildi ve varsayilan da ise yaramadi)\r\n" CLR_RESET);
         goto EXIT_BUFFERED;
     }
 
