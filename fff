@@ -1,5 +1,3 @@
-/* ... (Önceki include ve define tanımları aynen kalacak) ... */
-
 /* ============================================================ */
 /* FONKSIYON 2: RAW HEX YUKLEME (Ring Buffer / Sürükle-Bırak)   */
 /* ============================================================ */
@@ -22,7 +20,12 @@ void Receive_Raw_Hex_File(void)
 
     /* --- Temizlik --- */
     g_ram_idx = 0;
-    hex_upper_addr = 0; // Varsayılan 0. Eğer Hex dosyasında 04 kaydı yoksa 0 kabul edilir.
+    
+    /* !!! KRİTİK DÜZELTME BURADA !!! */
+    /* Varsayılan üst adresi 0 yerine 0x0800 yapıyoruz.
+       Böylece dosya başında adres belirtilmese bile Flash'a yazar. */
+    hex_upper_addr = 0x0800; 
+    
     smart_base_addr = 0xFFFFFFFF;
     smart_dirty = 0;
     memset(smart_buffer, 0xFF, 16);
@@ -85,98 +88,90 @@ void Receive_Raw_Hex_File(void)
     }
 
     /* --- ADIM 3: FLASH'A YAZMA AŞAMASI --- */
-    HAL_UART_AbortReceive(&huart3); // Interruptları sustur, yazmaya odaklan
+    HAL_UART_AbortReceive(&huart3); // Interruptları sustur
 
     printf(CLR_RED "Hedef Slot Siliniyor... " CLR_RESET); fflush(stdout);
     if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
         printf("[FAIL] Silme Hatasi!\r\n"); goto EXIT_BUFFERED;
     }
-    printf("[OK]\r\nRAM -> Flash isleniyor...\r\n"); 
+    printf("[OK]\r\nRAM -> Flash isleniyor... (Base: 0x%04X....)\r\n", hex_upper_addr); 
 
     /* RAM'deki veriyi satır satır işle */
     for (uint32_t i = 0; i < g_ram_idx; i++)
     {
         char c = g_ram_buffer[i];
 
-        // Yeni satır başlangıcı (Intel Hex ':' ile başlar)
         if (c == ':') {
             line_idx = 0;
             line_buffer[line_idx++] = ':';
             continue;
         }
 
-        // Satır sonu geldi mi? (\n veya \r)
         if (c == '\n' || c == '\r') {
-            if (line_idx > 0) { // Dolu bir satırımız var
-                line_buffer[line_idx] = '\0'; // String sonlandır
+            if (line_idx > 0) { 
+                line_buffer[line_idx] = '\0'; 
 
-                // Satır parse et
                 if (line_buffer[0] == ':') {
                     uint8_t count = ParseByte(&line_buffer[1]);
                     uint16_t alow = (ParseByte(&line_buffer[3]) << 8) | ParseByte(&line_buffer[5]);
                     uint8_t type  = ParseByte(&line_buffer[7]);
 
-                    // TYPE 04: Extended Linear Address (Üst 16-bit Adres)
+                    // TYPE 04: Extended Linear Address
                     if (type == 0x04) {
                         hex_upper_addr = (ParseByte(&line_buffer[9]) << 8) | ParseByte(&line_buffer[11]);
                         printf(" > Ust Adres Guncellendi: 0x%04X....\r\n", hex_upper_addr);
                     }
                     // TYPE 00: Data Record
                     else if (type == 0x00) {
+                        // GÜVENLİK FİLTRESİ: Eğer adres 0x08000000'dan küçük kaldıysa zorla düzelt
+                        if (hex_upper_addr == 0) hex_upper_addr = 0x0800;
+
                         current_addr = (hex_upper_addr << 16) | alow;
 
-                        // --- KRİTİK KONTROL ---
-                        // Adresin geçerli bir Flash adresi olup olmadığını ve
-                        // seçilen slota uygun olup olmadığını kontrol et.
+                        // Adres geçerli mi?
                         if (current_addr >= 0x08000000) 
                         {
-                            // Slot kontrolü (Opsiyonel: Eğer slot dışına yazmaya çalışıyorsa uyar)
                             uint8_t range_check = Check_Hex_Address_Range(current_addr, target_slot);
                             
+                            // 1: Hedef Slot, 2: Ortak Alan (Common)
                             if (range_check == 1 || range_check == 2) { 
-                                // 1: Hedef Slot, 2: Shared/Common alan (izin veriliyorsa)
                                 for(int k=0; k<count; k++) {
                                     Smart_Hex_Write_Byte(current_addr + k, ParseByte(&line_buffer[9+(k*2)]));
                                 }
                                 written_byte_count += count;
                             } else {
-                                skipped_byte_count += count;
-                                // İlk hatada uyar, spam yapma
-                                if (skipped_byte_count < 20) {
-                                    printf("[UYARI] Adres Slot Disi: 0x%08lX (Hedef: %c)\r\n", current_addr, (target_slot == SLOT_A_ADDR ? 'A' : 'B'));
+                                // Sadece ilk 5 hatayı göster, ekranı doldurma
+                                if (skipped_byte_count < 5) {
+                                     printf("[UYARI] Slot Disi: 0x%08lX (Beklenen: %c)\r\n", current_addr, (target_slot == SLOT_A_ADDR ? 'A' : 'B'));
                                 }
+                                skipped_byte_count += count;
                             }
                         } else {
-                            // 0x08000000 altı adresler (genelde hata veya RAM adresi)
-                            printf("[HATA] Gecersiz Adres: 0x%08lX\r\n", current_addr);
+                            // Hala 0x0800 altındaysa hata bas
+                             if (skipped_byte_count < 5)
+                                printf("[HATA] Gecersiz Adres: 0x%08lX\r\n", current_addr);
+                             skipped_byte_count++;
                         }
                     }
-                    // TYPE 01: EOF
-                    else if (type == 0x01) {
-                        // Dosya sonu
-                    }
                 }
-                line_idx = 0; // Bir sonraki satır için sıfırla
+                line_idx = 0; 
             }
         } 
         else {
-            // Normal karakterleri buffera ekle
             if (line_idx < 511) line_buffer[line_idx++] = c;
         }
     }
 
-    Flush_Smart_Buffer(); // Kalan son paketleri yaz
+    Flush_Smart_Buffer(); 
 
     printf("\r\n--------------------------------------\r\n");
     printf("Yazilan Byte: %lu\r\n", written_byte_count);
-    printf("Atlanan Byte: %lu (Yanlis Adres/Slot)\r\n", skipped_byte_count);
     
     if (written_byte_count == 0) {
-        printf(CLR_RED "[HATA] Hicbir veri Flash'a yazilmadi! Adresleri kontrol et." CLR_RESET "\r\n");
+        printf(CLR_RED "[HATA] Hicbir veri Flash'a yazilmadi!" CLR_RESET "\r\n");
         goto EXIT_BUFFERED;
     }
 
-    // Başarılı ise aktif slotu ayarla ve reset at
     if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
     else Set_Active_Slot(SLOT_A_ACTIVE);
 
@@ -187,5 +182,4 @@ void Receive_Raw_Hex_File(void)
 
 EXIT_BUFFERED:
     printf("\r\n[FAIL] Islem Basarisiz.\r\n");
-    // Hata durumunda interruptları tekrar açma ihtiyacı olabilir, ama reset daha temiz.
 }
