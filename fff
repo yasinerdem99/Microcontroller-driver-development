@@ -1,13 +1,14 @@
 /*
- * Bootloader_core.c
- * MANUEL KONTROL VERSIYONU (Secmeli Yukleme ve Atlama)
+ * Bootloader_hex.c
+ * XMODEM: Ping-Pong + Safe Erase Logic
+ * RAW: Ring Buffer + Interrupt
  */
 
-#include "main.h"
-#include <stdio.h>
+#include "Bootloader_hex.h"
 #include "Bootloader_flash.h"
 #include "Bootloader_config.h"
-#include "Bootloader_hex.h"
+#include <stdio.h>
+#include <string.h>
 
 extern UART_HandleTypeDef huart3;
 
@@ -18,474 +19,302 @@ extern UART_HandleTypeDef huart3;
 #define CAN 0x18
 #define CHAR_C 'C'
 
-/* --- BU KISMI EN TEPEYE EKLE --- */
-#include <string.h>  // <--- BU COK ONEMLI!
-
-/* Renk Kodları */
+/* --- RENK KODLARI --- */
 #define CLR_RESET   "\033[0m"
-#define CLR_RED     "\033[31m"
-#define CLR_GREEN   "\033[32m"
-#define CLR_YELLOW  "\033[33m"
-#define CLR_CYAN    "\033[36m"
-#define CLR_BOLD    "\033[1m"
-#define CLR_MAGENTA "\033[35m"
-#define CLR_WHITE   "\033[37m"
+#define CLR_CYAN    "\033[1;96m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_YELLOW  "\033[1;93m"
 
-/* Kullanıcı Ayarları */
-#define USER_NAME       "yerdem"
-#define PROMPT_TEXT     "cboot > "
-#define CMD_BUFFER_LEN  64
+/* --- RING BUFFER --- */
+#define RING_BUFFER_SIZE  4096
+static uint8_t  rb_data[RING_BUFFER_SIZE];
+static volatile uint16_t rb_head = 0;
+static volatile uint16_t rb_tail = 0;
+static uint8_t  rx_byte_it;
 
-/* --- PROTOTIPLER --- */
-void Xmodem_Receive_File(void);
-void Bootloader_Jump_To_Address(uint32_t jump_addr);
-uint8_t Verify_Firmware_Address(uint32_t target_slot, uint8_t *data_buffer);
-uint32_t Get_Active_Slot_Addr(void);
-void Set_Active_Slot(uint32_t new_slot_flag);
-uint16_t Calc_CRC16(const uint8_t *data, uint16_t size);
-/* ------------------- */
+/* HEX Parsing & Buffer Değişkenleri */
+static uint32_t hex_upper_addr = 0;
+static uint8_t  smart_buffer[16];
+static uint32_t smart_base_addr = 0xFFFFFFFF;
+static uint8_t  smart_dirty = 0;
 
-/* --- BU FONKSIYONLARI MENU LOOP'UN USTUNE YAPISTIR --- */
+/* ============================================================ */
+/* YARDIMCI FONKSİYONLAR                                        */
+/* ============================================================ */
 
-/* 1.  Logo Basma Fonksiyonu */
-void Bootloader_Print_Logo(void)
-{
-	/* 1. Havali ve Buyuk Logo Basma Fonksiyonu */
-
-
-	    printf("\033[2J\033[H");
-
-	    HAL_Delay(10);// Ekrani temizle
-
-
-
-
-		printf(CLR_RED "                       ++                                        \r\n");
-		printf(CLR_RED "                        +++                                      \r\n");
-		printf(CLR_RED "                        ++++                                     \r\n");
-		printf(CLR_RED "                         ++++                                    \r\n");
-		printf(CLR_RED "                          +++                                    \r\n");
-		printf(CLR_RED "                     +++   +++                                   \r\n");
-		printf(CLR_RED "                      +++   +++                                  \r\n");
-		printf(CLR_RED "                       +++   ++                                  \r\n");
-		printf(CLR_RED "                       +++   +++                                 \r\n");
-		printf(CLR_RED "                        +++   +++                                \r\n");
-		printf(CLR_RED " +++++++++++++++++++++  ++++  ++++++++++++++++++++++             \r\n");
-		printf(CLR_RED " +++++                                        ++++               \r\n");
-		printf(CLR_RED "   +++++                                   ++++                  \r\n");
-		printf(CLR_RED "     +++++                              +++++                    \r\n");
-		printf(CLR_RED "       +++++                          +++++                      \r\n");
-		printf(CLR_RED "         +++++                      ++++                         \r\n");
-		printf(CLR_RED "            +++                     +++                          \r\n");
-		printf(CLR_RED "            +++                   ++++                           \r\n");
-		printf(CLR_RED "           +++             ++++   +++                            \r\n");
-		printf(CLR_RED "           +++       ++     +++    +++                           \r\n");
-		printf(CLR_RED "          +++      +++++     +++   +++                           \r\n");
-		printf(CLR_RED "         +++    +++++         +++   +++                          \r\n");
-		printf(CLR_RED "         +++  ++++             +++   ++                          \r\n");
-		printf(CLR_RED "       +++ +++++                +++   +++                        \r\n");
-		printf(CLR_RED "      +++++++                          +++                       \r\n");
-		printf(CLR_RED "     ++++++                             ++++                     \r\n");
-		printf(CLR_RED "      ++                                 ++  					 \r\n");
-
-	        /* --- HAVELSAN YAZISI (HER SATIRA CLR_WHITE EKLENDI) --- */
-
-
-
-
-printf(CLR_WHITE " __    __       ___   ____    ____  _______  __          _______.     ___      .__   __.           \r\n");
-printf(CLR_WHITE "|  |  |  |     /   \\  \\   \\  /   / |   ____||  |        /       |    /   \\     |  \\ |  |      \r\n");
-printf(CLR_WHITE "|  |__|  |    /  ^  \\  \\   \\/   /  |  |__   |  |       |   (----`   /  ^  \\    |   \\|  |      \r\n");
-printf(CLR_WHITE "|   __   |   /  /_\\  \\  \\      /   |   __|  |  |        \\   \\      /  /_\\  \\   |  . `  |     \r\n");
-printf(CLR_WHITE "|  |  |  |  /  _____  \\  \\    /    |  |____ |  `----.----)   |    /  _____  \\  |  |\\   |        \r\n");
-printf(CLR_WHITE "|__|  |__| /__/     \\__\\  \\__/     |_______||_______|_______/    /__/     \\__\\ |__| \\__|      \r\n");
-
-
-
-
-
-	    printf(CLR_RESET);
-
-	    uint32_t active_slot = Get_Active_Slot_Addr();
-
-	    printf("\r\n");
-	        printf(CLR_CYAN   "   User  : " CLR_WHITE "%s" CLR_RESET "\r\n", USER_NAME);
-	        printf(CLR_YELLOW "   Board : " CLR_WHITE "STM32U5A9" CLR_YELLOW " | Unit: " CLR_WHITE "RTOS Embedded Software" CLR_RESET "\r\n");
-
-	        /* AKTIF SLOT GOSTERGESI */
-	        if (active_slot == SLOT_A_ADDR) {
-	            printf(CLR_GREEN  "   STATUS: [ AKTIF FLASH: A ]" CLR_RESET "\r\n");
-	        } else {
-	            printf(CLR_MAGENTA "   STATUS: [ AKTIF FLASH: B ]" CLR_RESET "\r\n");
-	        }
-
-	        printf("   ---------------------------------------------------------------------------\r\n");
-	        printf(CLR_GREEN  "   Komutlar: help, boot, load_bin, load_hex, flash_a, flash_b, reboot, clear" CLR_RESET "\r\n\n");
-
-}
-
-void Print_Help_Menu(void)
-{
-    printf(CLR_CYAN);
-    printf(" +----------+--------------------------------------------------+\r\n");
-    printf(" | KOMUT    | ACIKLAMA                                         |\r\n");
-    printf(" +----------+--------------------------------------------------+\r\n");
-    printf(CLR_RESET);
-
-    printf(" | " CLR_BOLD "boot" CLR_RESET "     | Aktif olan slottaki uygulamayi baslatir          |\r\n");
-    printf(" | " CLR_BOLD "load_bin" CLR_RESET " | Bin yazilim yukleme sihirbazini acar             |\r\n");
-    printf(" | " CLR_BOLD "load_hex" CLR_RESET " | Hex yazilim yukleme sihirbazini acar             |\r\n");
-    printf(" | " CLR_BOLD "flash_a" CLR_RESET "  | FLASH A (Bank 1) uygulamasina atlar              |\r\n");
-    printf(" | " CLR_BOLD "flash_b" CLR_RESET "  | FLASH B (Bank 2) uygulamasina atlar              |\r\n");
-    printf(" | " CLR_BOLD "info" CLR_RESET "     | Sistem ve Slot adres bilgilerini gosterir        |\r\n");
-    printf(" | " CLR_BOLD "reboot" CLR_RESET "   | Cihaza donanimsal reset atar                     |\r\n");
-    printf(" | " CLR_BOLD "clear" CLR_RESET "    | Ekrani temizler ve logoyu tekrar basar           |\r\n");
-
-    printf(CLR_CYAN);
-    printf(" +----------+--------------------------------------------------+\r\n");
-    printf(CLR_RESET "\r\n");
-}
-/* 2. Satır Okuma Fonksiyonu (Enter'a basana kadar bekler) */
-void CLI_Read_Line(char *buffer, uint16_t max_len)
-{
-    uint16_t index = 0;
-    uint8_t rx_char;
-
-    /* Silme Efekti İçin Özel Dizi: [Geri Git] [Boşluk Bas] [Geri Git] */
-    uint8_t backspace_seq[3] = {0x08, 0x20, 0x08};
-
-    memset(buffer, 0, max_len);
-
-    while(1)
-    {
-        if (HAL_UART_Receive(&huart3, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK)
-        {
-            /* --- ENTER TUSU --- */
-            if (rx_char == '\r' || rx_char == '\n') {
-                printf("\r\n\r\n\r\n"); // 3 satir bosluk
-                buffer[index] = '\0';
-                return;
-            }
-
-            /* --- BACKSPACE TUSU  --- */
-            else if (rx_char == 0x08 || rx_char == 0x7F) {
-                if (index > 0) {
-                    index--;
-                    buffer[index] = '\0'; // Hafızadan sil
-
-                    /* EKRANDAN SILME (Printf yerine HAL kullanıyoruz) */
-                    /* Bu komut anında gönderilir ve harfi siler */
-                    HAL_UART_Transmit(&huart3, backspace_seq, 3, 10);
-                }
-            }
-
-            /* --- NORMAL KARAKTER --- */
-            else {
-                // Sadece yazilabilir karakterleri al
-                if (rx_char >= 32 && rx_char <= 126) {
-                    if (index < max_len - 1) {
-                        buffer[index++] = rx_char;
-                        // Ekrana bas (Echo)
-                        HAL_UART_Transmit(&huart3, &rx_char, 1, 10);
-                    }
-                }
-            }
-        }
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART3) {
+        rb_data[rb_head++] = rx_byte_it;
+        if (rb_head >= RING_BUFFER_SIZE) rb_head = 0;
+        HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
     }
 }
 
-uint32_t Get_Active_Slot_Addr(void)
-{
-    uint32_t config_val = *(volatile uint32_t*)CONFIG_PAGE_ADDR;
-    if (config_val == SLOT_B_ACTIVE) return SLOT_B_ADDR;
-    return SLOT_A_ADDR;
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+    if (huart->Instance == USART3) {
+        HAL_UART_Receive_IT(&huart3, &rx_byte_it, 1);
+    }
 }
 
-void Set_Active_Slot(uint32_t new_slot_flag)
-{
-    FLASH_EraseInitTypeDef EraseInitStruct;
-    uint32_t PageError;
-
-    HAL_FLASH_Unlock();
-    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-
-    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
-    EraseInitStruct.Banks       = FLASH_BANK_1;
-    EraseInitStruct.Page        = (CONFIG_PAGE_ADDR - FLASH_BASE) / 0x2000;
-    EraseInitStruct.NbPages     = 1;
-
-    HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
-
-    uint32_t data_pack[4] = {new_slot_flag, 0, 0, 0};
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)data_pack);
-
-    HAL_FLASH_Lock();
+static int Ring_Buffer_Read(uint8_t *byte) {
+    if (rb_head == rb_tail) return -1;
+    *byte = rb_data[rb_tail++];
+    if (rb_tail >= RING_BUFFER_SIZE) rb_tail = 0;
+    return 0;
 }
 
-uint16_t Calc_CRC16(const uint8_t *data, uint16_t size) {
+static uint8_t HexCharToByte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
+
+static uint8_t ParseByte(char* ptr) {
+    return (HexCharToByte(ptr[0]) << 4) | HexCharToByte(ptr[1]);
+}
+
+static uint16_t Calc_CRC16_Hex(const uint8_t *data, uint16_t size) {
     uint16_t crc = 0;
     while (size--) {
         crc ^= (*data++) << 8;
         for (int i = 0; i < 8; i++) {
-            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
-            else crc = crc << 1;
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021; else crc = crc << 1;
         }
     }
     return crc;
 }
 
-uint8_t Verify_Firmware_Address(uint32_t target_slot, uint8_t *data_buffer)
-{
-    uint32_t reset_handler_addr = *((uint32_t*)&data_buffer[3 + 4]);
-    printf("\r\n[ANALIZ] Dosya Reset Vektoru: 0x%08lX\r\n", reset_handler_addr);
-
-    if (target_slot == SLOT_A_ADDR) {
-        if (reset_handler_addr >= 0x08010000 && reset_handler_addr < 0x08200000) return 1;
+/* Menü girişi okumak için */
+static void Hex_Read_Line(char *buffer, uint16_t max_len) {
+    uint16_t index = 0; uint8_t rx_char; memset(buffer, 0, max_len);
+    while(1) {
+        if (HAL_UART_Receive(&huart3, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
+            if (rx_char == '\r' || rx_char == '\n') { printf("\r\n"); buffer[index] = 0; return; }
+            if (index < max_len - 1) buffer[index++] = rx_char;
+        }
     }
-    else if (target_slot == SLOT_B_ADDR) {
-        if (reset_handler_addr >= 0x08200000) return 1;
-    }
+}
 
-    if (reset_handler_addr >= 0x08000000 && reset_handler_addr < 0x08010000) {
-         printf("[UYARI] BOOTLOADER dosyasini yuklemeye calisiyorsunuz!\r\n");
-    } else {
-         printf("[UYARI] Dosya adresi, sectiginiz Slot (%s) ile uyuşmuyor!\r\n", (target_slot == SLOT_A_ADDR) ? "A" : "B");
+static void Flush_Smart_Buffer(void) {
+    if (smart_dirty && smart_base_addr != 0xFFFFFFFF) {
+        if (Bootloader_Flash_Write(smart_base_addr, smart_buffer, 16) == 0)
+            printf("\r\n[HATA] Yazma Hatasi!\r\n");
+        smart_dirty = 0;
     }
+}
 
+static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
+    uint32_t aligned_base = addr & 0xFFFFFFF0;
+    uint8_t offset = addr & 0x0F;
+    if (aligned_base != smart_base_addr) {
+        Flush_Smart_Buffer();
+        memset(smart_buffer, 0xFF, 16);
+        smart_base_addr = aligned_base;
+        smart_dirty = 0;
+    }
+    smart_buffer[offset] = byte;
+    smart_dirty = 1;
+}
+
+static uint8_t Check_Hex_Address_Range(uint32_t addr, uint32_t target_slot) {
+    if (addr >= 0x08000000 && addr < 0x08010000) return 2; // Bootloader Koruması
+    if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
+    if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
     return 0;
 }
 
-void Xmodem_Receive_File(void)
+/* ============================================================ */
+/* FONKSIYON 1: XMODEM HEX (PING-PONG + GUVENLI SILME)          */
+/* ============================================================ */
+void Xmodem_Receive_Hex_File(void)
 {
     uint8_t rx_buffer[133];
     uint8_t packet_number = 1;
-    uint8_t status;
-    uint8_t rx_char;
-    uint8_t first_packet_received = 0;
-    uint32_t target_address = 0;
+    uint8_t status = 0;
+    uint8_t xmodem_done = 0;
+    uint8_t hex_parsing_done = 0;
+    
+    char line_buffer[128];
+    uint8_t line_idx = 0, in_line = 0;
+    
+    uint32_t target_slot = 0;
+    uint8_t is_flash_erased = 0;
+    
+    char user_response[10];
+    uint32_t total_bytes = 0;
 
-    /* --- ADIM 1: KULLANICIYA HEDEF SOR --- */
+    /* Değişkenleri Sıfırla */
+    hex_upper_addr = 0;
+    smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
+
+    /* --- 1. HEDEFİ OTOMATİK BELİRLE (PING-PONG) --- */
+    extern uint32_t Get_Active_Slot_Addr(void);
     uint32_t current_active = Get_Active_Slot_Addr();
-
-    printf("========================================\r\n");
-
+    
+    printf("\r\n========================================\r\n");
     if (current_active == SLOT_A_ADDR) {
-    	target_address = SLOT_B_ADDR;
-        printf("[BILGI] Mevcut surum: Flash A \r\n");
-        printf("HEDEF: Yeni surum :Flash B (0x%08lX) adresine yuklenecektir\r\n", target_address);
+        target_slot = SLOT_B_ADDR;
+        printf(" [INFO] Mevcut: SLOT A (Aktif)\r\n");
+        printf(" [AUTO] HEDEF : SLOT B (0x%08lX)\r\n", target_slot);
+    } else {
+        target_slot = SLOT_A_ADDR;
+        printf(" [INFO] Mevcut: SLOT B (Aktif)\r\n");
+        printf(" [AUTO] HEDEF : SLOT A (0x%08lX)\r\n", target_slot);
     }
-    else  {
-    	target_address = SLOT_A_ADDR;
-        printf("[BILGI] Mevcut surum: Flash B \r\n");
-        printf("HEDEF: Yeni surum :Flash A (0x%08lX) adresine yuklenecektir\r\n", target_address);
-    }
-
     printf("========================================\r\n");
 
+    /* --- 2. ONAY AL --- */
+    printf(CLR_YELLOW "Islemi onayliyor musunuz? (y/n) > " CLR_RESET);
+    fflush(stdout);
+    Hex_Read_Line(user_response, 10);
 
-
-    printf("Dikkat! Hedef Slot Silinecek. Onayliyor musunuz? (y/n) > \r\n");
-    while(1) {
-        HAL_UART_Receive(&huart3, &rx_char, 1, HAL_MAX_DELAY);
-        if (rx_char == 'y' || rx_char == 'Y') break;
-        if (rx_char == 'n' || rx_char == 'N') { printf("Iptal.\r\n"); return; }
-    }
-
-
-
-    uint32_t write_ptr = target_address;
-
-    /* Handshake */
-    printf("\r\n[HAZIR] Dosya Bekleniyor... (Iptal icin 'e' basin)\r\n");
-
-     uint32_t last_c_time = 0;
-     uint8_t handshake_done = 0;
-
-     while (!handshake_done)
-     {
-         uint32_t current_time = HAL_GetTick();
-
-         /* 1. Saniyede bir 'C' gönder (Arka Planda) */
-         if (current_time - last_c_time > 1000) {
-             uint8_t c = CHAR_C;
-             HAL_UART_Transmit(&huart3, &c, 1, 100);
-             last_c_time = current_time;
-         }
-
-         /* 2. Veri Dinleme (Yanıp sönme kodu SILINDI) */
-         /* Sadece veri gelip gelmediğine bakıyoruz */
-         if (HAL_UART_Receive(&huart3, &status, 1, 10) == HAL_OK)
-         {
-             if (status == 'e' || status == 'E') {
-                 printf("\r\n[IPTAL] Kullanici iptal etti.\r\n");
-                 return;
-             }
-             if (status == SOH) {
-                 handshake_done = 1;
-                 /* Ekrana yazı basmıyoruz, direkt işe koyuluyoruz */
-             }
-         }
-     }
-
-    /* Paket Döngüsü */
-    while (1) {
-        rx_buffer[0] = status;
-
-        if (HAL_UART_Receive(&huart3, &rx_buffer[1], 132, 2000) != HAL_OK) {
-            uint8_t nack=NAK; HAL_UART_Transmit(&huart3, &nack, 1, 100);
-            HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        if (rx_buffer[1] != packet_number || rx_buffer[2] != (uint8_t)(255 - packet_number)) {
-            uint8_t nack=NAK; HAL_UART_Transmit(&huart3, &nack, 1, 100);
-            HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        uint16_t received_crc = (rx_buffer[131] << 8) | rx_buffer[132];
-        uint16_t calculated_crc = Calc_CRC16(&rx_buffer[3], 128);
-
-        if (received_crc != calculated_crc) {
-             uint8_t nack=NAK; HAL_UART_Transmit(&huart3, &nack, 1, 100);
-             HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        /* --- KONTROL VE SILME --- */
-        if (first_packet_received == 0)
-        {
-            // Kullanıcının seçtiği slota göre dosyayı doğrula
-            if (Verify_Firmware_Address(target_address, rx_buffer) == 0)
-            {
-                uint8_t can = CAN;
-                for(int i=0; i<5; i++) HAL_UART_Transmit(&huart3, &can, 1, 10);
-
-                uint8_t trash;
-                while(HAL_UART_Receive(&huart3, &trash, 1, 50) == HAL_OK); // Çöp temizle
-
-                printf("\r\n\r\n[HATA] SECILEN SLOT ILE DOSYA UYUSMUYOR!\r\n");
-                printf("Islem Iptal Edildi.\r\n");
-                return;
-            }
-
-            printf("[OK] Dosya Uygun. Siliniyor... \r\n");
-
-            if (Bootloader_Flash_Erase_Target_Slot(target_address) == 0) {
-                uint8_t can = CAN; HAL_UART_Transmit(&huart3, &can, 1, 100);
-                printf("\r\n[HATA] Silme basarisiz!\r\n");
-                return;
-            }
-            first_packet_received = 1;
-        }
-
-        /* Yazma */
-        uint8_t ack=ACK, can=CAN;
-        if (Bootloader_Flash_Write(write_ptr, &rx_buffer[3], 128)) {
-            write_ptr += 128;
-            packet_number++;
-            HAL_UART_Transmit(&huart3, &ack, 1, 100);
-        } else {
-            HAL_UART_Transmit(&huart3, &can, 1, 100);
-            printf("\r\nWrite Failed!\r\n");
-            return;
-        }
-
-        /* Bitiş */
-        HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY);
-        if (status == EOT) {
-            HAL_UART_Transmit(&huart3, &ack, 1, 100);
-            printf("\r\nYukleme Basarili!\r\n");
-
-            /* Yukleme yapilan slotu AKTIF olarak işaretle */
-            if (target_address == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
-            else Set_Active_Slot(SLOT_A_ACTIVE);
-
-            return;
-        }
-    }
-}
-
-
-void Bootloader_Menu_Loop(void)
-{
-    char cmd_buffer[CMD_BUFFER_LEN];
-    uint32_t active_slot;
-
-    /* Açılışta Logoyu Bas */
-    Bootloader_Print_Logo();
-
-    while(1)
-    {
-        active_slot = Get_Active_Slot_Addr();
-
-        /* Prompt */
-        printf(CLR_MAGENTA CLR_BOLD "%s" CLR_RESET, PROMPT_TEXT);
-        fflush(stdout);
-
-        /* Komut Bekle */
-        CLI_Read_Line(cmd_buffer, CMD_BUFFER_LEN);
-
-        /* Boş enter basıldıysa sadece yeni satır ver */
-        if (strlen(cmd_buffer) == 0) continue;
-
-        /* --- KOMUTLAR --- */
-
-        if (strcmp(cmd_buffer, "help") == 0 || strcmp(cmd_buffer, "?") == 0) {
-            Print_Help_Menu();
-        }
-        else if (strcmp(cmd_buffer, "boot") == 0) {
-            printf("Uygulama baslatiliyor...\r\n");
-            Bootloader_Jump_To_Address(active_slot);
-            printf(CLR_RED "[HATA] Slot bos!" CLR_RESET "\r\n\n");
-        }
-        else if (strcmp(cmd_buffer, "load_bin") == 0) {
-            Xmodem_Receive_File();
-            HAL_Delay(1000);
-
-        }
-        else if (strcmp(cmd_buffer, "flash_a") == 0) {
-            printf("SLOT A'ya geciliyor...\r\n");
-            HAL_Delay(500);
-            Bootloader_Jump_To_Address(SLOT_A_ADDR);
-        }
-        else if (strcmp(cmd_buffer, "flash_b") == 0) {
-            printf("SLOT B'ye geciliyor...\r\n");
-            HAL_Delay(500);
-            Bootloader_Jump_To_Address(SLOT_B_ADDR);
-        }
-        else if (strcmp(cmd_buffer, "reboot") == 0) {
-            HAL_NVIC_SystemReset();
-        }
-        else if (strcmp(cmd_buffer, "clear") == 0) {
-            Bootloader_Print_Logo();
-        }
-        else if (strcmp(cmd_buffer, "load_hex") == 0) {
-             Xmodem_Receive_Hex_File();
-             HAL_Delay(1000);
-        }
-        else if (strcmp(cmd_buffer, "load_raw") == 0) {
-             Receive_Raw_Hex_File();
-             HAL_Delay(1000);
-        }
-        else {
-            printf(CLR_RED "Bilinmeyen komut: '%s'" CLR_RESET "\r\n\n", cmd_buffer);
-        }
-    }
-}
-
-/* Parametre olarak adres alan yeni Jump fonksiyonu */
-void Bootloader_Jump_To_Address(uint32_t jump_addr)
-{
-    uint32_t mspValue = *(volatile uint32_t*) jump_addr;
-    uint32_t resetValue = *(volatile uint32_t*) (jump_addr + 4);
-
-    if (mspValue == 0xFFFFFFFF) {
-        printf("\r\n[HATA] Bu slot bos (Veri yok)!\r\n");
+    if (user_response[0] != 'y' && user_response[0] != 'Y') {
+        printf(CLR_RED "[IPTAL] Islem durduruldu.\r\n" CLR_RESET);
         return;
     }
 
-    SCB->VTOR = jump_addr;
+    /* NOT: Burada silme yapmıyoruz! Dosya gelince adresine bakıp sileceğiz. */
+    printf("\r\n[HAZIR] Lutfen .hex dosyasini gonderin...\r\n");
+    
+    /* --- 3. HANDSHAKE --- */
+    uint32_t last_c = 0;
+    uint8_t handshake = 0;
+    while (!handshake) {
+        if (HAL_GetTick() - last_c > 1000) {
+            uint8_t c = CHAR_C; HAL_UART_Transmit(&huart3, &c, 1, 100); last_c = HAL_GetTick();
+        }
+        if (HAL_UART_Receive(&huart3, &status, 1, 10) == HAL_OK) {
+            if (status == 'e' || status == 'E') { printf("\r\n[IPTAL]\r\n"); return; }
+            if (status == SOH) handshake = 1;
+        }
+    }
 
-    void (*app_reset_handler)(void);
-    __set_MSP(mspValue);
-    app_reset_handler = (void*) resetValue;
-    app_reset_handler();
+    /* --- 4. PAKET DÖNGÜSÜ --- */
+    while (!xmodem_done) 
+    {
+        rx_buffer[0] = status; 
+        if (HAL_UART_Receive(&huart3, &rx_buffer[1], 132, 2000) != HAL_OK) {
+            uint8_t n = NAK; HAL_UART_Transmit(&huart3, &n, 1, 100);
+            HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
+        }
+        
+        uint16_t rcrc = (rx_buffer[131] << 8) | rx_buffer[132];
+        if (rcrc != Calc_CRC16_Hex(&rx_buffer[3], 128)) {
+             uint8_t n = NAK; HAL_UART_Transmit(&huart3, &n, 1, 100);
+             HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        total_bytes += 128;
+        printf("\r[XMODEM] Paket: %3d | Bytes: %lu   ", packet_number, total_bytes); fflush(stdout);
+
+        if (!hex_parsing_done) 
+        {
+            for (int i = 0; i < 128; i++) 
+            {
+                char c = rx_buffer[3 + i]; 
+                if (c == 0x1A) continue;
+                if (c == ':') { in_line = 1; line_idx = 0; continue; }
+                
+                if (in_line) 
+                {
+                    if (c == '\r' || c == '\n') { 
+                        in_line = 0; 
+                        line_buffer[line_idx] = '\0';
+                        
+                        uint8_t count = ParseByte(&line_buffer[0]);
+                        uint16_t alow = (ParseByte(&line_buffer[2])<<8)|ParseByte(&line_buffer[4]);
+                        uint8_t type  = ParseByte(&line_buffer[6]);
+                        
+                        /* TYPE 04: Adres Güncelle (Önce bunu işle!) */
+                        if (type == 0x04) {
+                            hex_upper_addr = (ParseByte(&line_buffer[8])<<8)|ParseByte(&line_buffer[10]);
+                        }
+                        
+                        /* TYPE 00: Data */
+                        else if (type == 0x00) { 
+                            uint32_t c_addr = (hex_upper_addr << 16) | alow;
+                            
+                            /* FİLTRE: 0x08... olmayan adresleri yoksay (Gürültü koruması) */
+                            if (c_addr < 0x08000000) continue;
+
+                            /* --- GÜVENLİK VE SİLME MANTIĞI --- */
+                            /* Henüz silinmediyse (ilk geçerli veri satırıysa) */
+                            if (is_flash_erased == 0) 
+                            {
+                                /* 1. Adresi Kontrol Et: Hedefe uyuyor mu? */
+                                uint8_t check = Check_Hex_Address_Range(c_addr, target_slot);
+                                
+                                if (check == 0 || check == 2) {
+                                    // HATA! Adres Yanlış
+                                    uint8_t can = CAN;
+                                    for(int k=0; k<5; k++) HAL_UART_Transmit(&huart3, &can, 1, 100);
+                                    
+                                    printf("\r\n\r\n" CLR_RED "[HATA] ADRES UYUSMAZLIGI!" CLR_RESET "\r\n");
+                                    printf("Gelen Adres : 0x%08lX\r\n", c_addr);
+                                    printf("Hedef Slot  : 0x%08lX\r\n", target_slot);
+                                    printf("Islem iptal edildi. Flash'a dokunulmadi.\r\n");
+                                    return; 
+                                }
+                                
+                                /* 2. Adres Doğru -> Şimdi SİL */
+                                printf("\r\n[INFO] Dosya Adresi Dogrulandi. Flash Siliniyor... "); fflush(stdout);
+                                if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+                                    uint8_t can = CAN;
+                                    for(int k=0; k<5; k++) HAL_UART_Transmit(&huart3, &can, 1, 100);
+                                    printf(CLR_RED "[FAIL] Silme Hatasi!\r\n" CLR_RESET);
+                                    return;
+                                }
+                                printf(CLR_GREEN "[OK]" CLR_RESET "\r\nYukleniyor... ");
+                                is_flash_erased = 1; // Bayrağı kaldır, artık sormadan yaz
+                            }
+                            
+                            /* Yazma İşlemi */
+                            for(int k=0; k<count; k++) 
+                                Smart_Hex_Write_Byte(c_addr+k, ParseByte(&line_buffer[8+(k*2)]));
+                        }
+                        /* TYPE 01: EOF */
+                        else if (type == 0x01) { 
+                            Flush_Smart_Buffer(); 
+                            hex_parsing_done = 1; 
+                        }
+                    } 
+                    else if (line_idx < 127) {
+                        line_buffer[line_idx++] = c;
+                    }
+                }
+            }
+        }
+        
+        uint8_t ack = ACK; HAL_UART_Transmit(&huart3, &ack, 1, 100);
+        packet_number++;
+        HAL_UART_Receive(&huart3, &status, 1, HAL_MAX_DELAY);
+        
+        if (status == EOT) {
+            HAL_UART_Transmit(&huart3, &ack, 1, 100);
+            Flush_Smart_Buffer(); 
+            
+            extern void Set_Active_Slot(uint32_t new_slot_flag);
+            if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
+            else Set_Active_Slot(SLOT_A_ACTIVE);
+            
+            xmodem_done = 1;
+        }
+    }
+    
+    printf("\r\n\n" CLR_GREEN "[OK] XMODEM Yukleme Tamamlandi! (Resetleniyor...)" CLR_RESET "\r\n");
+    HAL_Delay(500);
+    HAL_NVIC_SystemReset();
+}
+
+/* ============================================================ */
+/* FONKSIYON 2: RAW HEX (Mevcut Çalışan Kodun)                  */
+/* ============================================================ */
+void Receive_Raw_Hex_File(void)
+{
+    /* Buraya senin daha önce çalıştırdığın RAW kodunu yapıştırabilirsin */
+    /* Önceki mesajımdaki çalışan RAW kodu burada durabilir */
+    /* Karışıklık olmasın diye burayı boş bırakıyorum, ama silme! */
+    printf("\r\n[BILGI] Raw kodunu buraya yapistirin.\r\n");
 }
