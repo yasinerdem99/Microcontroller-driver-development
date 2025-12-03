@@ -1,90 +1,249 @@
-# STM32 Tabanlı Çok Kanallı Analog Sinyal Üreteci
+/*
+ * Bootloader_raw.c
+ * Yontem: RAM BUFFERED POLLING (Interruptsiz, Gecikmesiz)
+ * Mantik: Veriyi al -> RAM'e yaz (Hizli) -> Bitince Flash'a yaz (Guvenli)
+ */
 
-Bu proje, HAVELSAN stajı kapsamında geliştirilmiş, STM32F4xx tabanlı, UART ile kontrol edilebilen bir AC/DC analog çıkış modülüdür.
+#include "Bootloader_raw.h"
+#include "Bootloader_flash.h"
+#include "Bootloader_config.h"
+#include <stdio.h>
+#include <string.h>
 
-Proje, MAXREFDES24 (4-Kanal Akım/Voltaj Çıkış) modüllerini kullanarak, savunma sanayi test sistemlerine yönelik sinyal üretimi sağlar.
+extern UART_HandleTypeDef huart1; // UART1 kullanıyoruz
 
-## 🛠️ Temel Özellikler
+/* --- RAM BUFFER AYARLARI --- */
+/* 128KB RAM alani ayiriyoruz (STM32U5 icin yeterli) */
+/* Uygulama boyutu bundan buyukse artirabilirsin */
+#define APP_MAX_SIZE  (128 * 1024)
+static uint8_t g_app_buffer[APP_MAX_SIZE];
+static uint32_t g_app_len = 0;
 
-* **5 Kanal DC Çıkış:** Kanal 0, 1, 2, 3, 5
-* **1 Kanal AC Sinyal Çıkışı:** Kanal 4
-* **AC Sinyal:** $\pm20\text{mA}$ aralığında, $0\text{mA}$ merkezli, frekansı ve genliği ayarlanabilir sinüs dalgası.
-* **Genlik Haritalama (AC):** AC kanalı, aşağıdaki parçalı doğrusal (piecewise) mantığa göre genlik üretir.
-* **Kontrol Arayüzü:** UART üzerinden özel NMEA benzeri komut protokolü.
-* **Performans:** 16-örneklemeli (`SINE_LUT_SIZE=16`) optimize edilmiş Timer ISR (kesme) kullanarak 1kHz+ frekanslarda kilitlenmesiz (live-lock free) çalışma.
+/* --- RENK KODLARI --- */
+#define CLR_RESET   "\033[0m"
+#define CLR_CYAN    "\033[1;96m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_YELLOW  "\033[1;93m"
 
----
+/* Değişkenler */
+static uint32_t hex_upper_addr_raw = 0;
 
----
+/* Slot Fonksiyonları */
+extern void Set_Active_Slot(uint32_t new_slot_flag);
+extern uint32_t Get_Active_Slot_Addr(void);
 
-## 🔧 Kullanılan Araçlar ve Versiyonlar
+/* ============================================================ */
+/* YARDIMCI FONKSİYONLAR                                        */
+/* ============================================================ */
 
-Bu proje aşağıdaki araçlar ve kütüphaneler kullanılarak geliştirilmiştir:
+static uint8_t Raw_HexCharToByte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
 
-* **IDE:** STM32CubeIDE (Versiyon: `1.1x.x`)
-* **Kod Üretici:** STM32CubeMX (Versiyon: `6.x.x`)
-* **Firmware Kütüphanesi:** STM32Cube FW_F4 V1.27.0 (veya kullandığınız F4 HAL versiyonu)
-* **Hata Ayıklayıcı (Debugger):** ST-Link (V2 veya V3)
-* **Belgelendirme (Dokümantasyon):** Doxygen (Versiyon: `1.x.x`)
-* **Terminal:** PuTTY / Tera Term (veya kullandığınız seri port monitörü)
+static uint8_t Raw_ParseByte(char* ptr) {
+    return (Raw_HexCharToByte(ptr[0]) << 4) | Raw_HexCharToByte(ptr[1]);
+}
 
----
+/* Menü Seçimi İçin Satır Okuma */
+static void Raw_Read_Line(char *buffer, uint16_t max_len) {
+    uint16_t index = 0; uint8_t rx_char; memset(buffer, 0, max_len);
+    while(1) {
+        if (HAL_UART_Receive(&huart1, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
+            if (rx_char == '\r' || rx_char == '\n') { printf("\r\n"); buffer[index] = 0; return; }
+            if (index < max_len - 1) {
+                buffer[index++] = rx_char;
+                HAL_UART_Transmit(&huart1, &rx_char, 1, 10);
+            }
+        }
+    }
+}
 
+static uint8_t Check_Address_Raw(uint32_t addr, uint32_t target_slot) {
+    if (addr >= 0x08000000 && addr < 0x08010000) return 2; // Bootloader Koruması
+    if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
+    if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
+    return 0;
+}
 
-## 📂 Klasör Yapısı
+/* ============================================================ */
+/* ANA FONKSIYON: RAW HEX YUKLEME (RAM BUFFERED)                */
+/* ============================================================ */
+void Receive_Raw_Hex_File(void)
+{
+    uint8_t c;
+    char line_buffer[512];
+    uint16_t line_idx = 0;
+    uint8_t in_line = 0;
 
-* `/fw`: STM32CubeIDE'de açılacak olan gömülü bellenim (firmware) kodları.
-* `/hw`: Modül şemaları ve kullanılan entegrelerin veri sayfaları (datasheet).
-* `/sw`: Projeyi test etmek için kullanılan bilgisayar taraflı yazılımlar (örn: Python test script'leri).
+    uint32_t target_slot_addr = 0;
+    uint32_t target_slot = 0;
+    char sub_cmd[10];
 
----
+    /* Temizlik */
+    memset(g_app_buffer, 0xFF, APP_MAX_SIZE); // RAM'i temizle (FF ile doldur)
+    g_app_len = 0;
+    hex_upper_addr_raw = 0;
 
-## ⚙️ Donanım Kurulumu
+    /* Dinamik Adres Yakalama */
+    uint32_t detected_base_addr = 0xFFFFFFFF;
+    uint8_t base_addr_locked = 0;
 
-* **MCU:** STM32F4xx Nucleo Kartı
-* **Analog Modüller:** 2 adet MAXREFDES24 (Toplam 8 kanal sağlar, 6'sı kullanılır)
-    * `dev1` (DC Kanallar 0-3): `SPI1` portuna bağlı.
-    * `dev2` (AC Kanal 4 & DC Kanal 5): `SPI2` portuna bağlı (SPI hızı 8Mbit/s'e ayarlı).
-* **Bağlantı:** AC sinyal çıkışı (`dev2, ch0`) ve DC çıkışı (`dev2, ch1`) aynı SPI portunu (`SPI2`) paylaştığı için, `main.c` içinde `__disable_irq()` / `__enable_irq()` kritik bölge koruması uygulanmıştır.
+    /* 1. SLOT SEÇİMİ */
+    printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
+    fflush(stdout);
+    Raw_Read_Line(sub_cmd, 10);
 
----
+    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
+        target_slot = SLOT_A_ADDR; target_slot_addr = SLOT_A_ADDR;
+        printf("HEDEF: SLOT A (0x%08X)\r\n", (unsigned int)target_slot_addr);
+    }
+    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
+        target_slot = SLOT_B_ADDR; target_slot_addr = SLOT_B_ADDR;
+        printf("HEDEF: SLOT B (0x%08X)\r\n", (unsigned int)target_slot_addr);
+    }
+    else {
+        printf("\r\nIptal.\r\n"); return;
+    }
 
-## UART Komut Arayüzü (API)
+    printf("\r\n" CLR_GREEN "[HAZIR] Dosyayi surukleyin... (RAM Modu / 0ms Delay)\r\n" CLR_RESET);
 
-Tüm komutlar `CR+LF` (\r\n) ile bitmelidir.
+    /* --- KESMELERİ KAPAT (SAF HIZ İÇİN) --- */
+    __disable_irq();
 
-**Format:** `$SCCON,CH,VAL,FREQ*hh`
-* **CH:** Kanal Numarası (0-5)
-* **VAL:** İstenen değer (DC için akım, AC için genlik komutu)
-* **FREQ:** Sadece AC kanalı (Kanal 4) için kullanılır. DC kanallar bu parametreyi görmezden gelir.
-* **hh:** `$` ile `*` arasındaki tüm karakterlerin XOR checksum değeri.
+    uint32_t last_rx = HAL_GetTick();
+    uint8_t data_started = 0;
 
-### 1. DC Çıkış (Kanal 0, 1, 2, 3, 5)
+    /* 2. VERİ ALMA DÖNGÜSÜ (POLLING) */
+    while(1)
+    {
+        /* 1ms Timeout ile oku. Veri gelirse hemen al. */
+        HAL_StatusTypeDef status = HAL_UART_Receive(&huart1, &c, 1, 1);
 
-`VAL` değeri `float` akım değerinin 1000 ile çarpımıdır.
-* **Örnek (12.5mA):** `$SCCON,1,12500*hh`
-* **Örnek (-5.0mA):** `$SCCON,1,-5000*hh`
+        if (status == HAL_OK)
+        {
+            last_rx = HAL_GetTick();
 
-### 2. AC Çıkış (Kanal 4)
+            /* Başlangıç Yakalama */
+            if (!data_started && c == ':') data_started = 1;
+            if (!data_started) continue; // Gürültüleri at
 
-`VAL` değeri, sinyalin tepe (peak) genliğini belirlemek için aşağıdaki parçalı doğrusal mantığı kullanır:
+            if (c == ':') {
+                in_line = 1; line_idx = 0; continue;
+            }
+            if (!in_line) continue;
 
-| Gönderilen `VAL` Komutu | Hedeflenen Tepe Akımı (Peak) |
-| :--- | :--- |
-| `20000` (+20) | $20.0 \text{ mA}$ |
-| `10000` (+10) | $15.0 \text{ mA}$ |
-| `0` (Sıfır) | $10.0 \text{ mA}$ |
-| `-10000` (-10) | $6.11 \text{ mA}$ |
-| `-20000` (-20) | $2.22 \text{ mA}$ |
+            if (c == '\r' || c == '\n') 
+            {
+                in_line = 0;
+                line_buffer[line_idx] = '\0';
 
-* **Örnek (10.0mA Tepe Genlikli 1kHz Sinyal):**
-    `$SCCON,4,0,1000*hh`
-* **Örnek (2.22mA Tepe Genlikli 500Hz Sinyal):**
-    `$SCCON,4,-20000,500*hh`
+                /* HEX Parsing */
+                uint8_t count = Raw_ParseByte(&line_buffer[0]);
+                uint16_t alow = (Raw_ParseByte(&line_buffer[2]) << 8) | Raw_ParseByte(&line_buffer[4]);
+                uint8_t type  = Raw_ParseByte(&line_buffer[6]);
 
----
+                /* Tip 04: Üst Adres */
+                if (type == 0x04) {
+                    hex_upper_addr_raw = (Raw_ParseByte(&line_buffer[8]) << 8) | Raw_ParseByte(&line_buffer[10]);
+                }
+                /* Tip 00: Veri (RAM'E KAYDET) */
+                else if (type == 0x00) {
+                    uint32_t abs_addr = (hex_upper_addr_raw << 16) | alow;
+                    
+                    /* İlk geçerli adresi kilitle (Dosyanın başlangıcını bul) */
+                    if (!base_addr_locked) {
+                        if(abs_addr >= 0x08000000) {
+                            detected_base_addr = abs_addr;
+                            base_addr_locked = 1;
+                        }
+                    }
 
-## ⚠️ Bilinen Sorunlar / Limitler
+                    /* RAM'e yazma */
+                    if (base_addr_locked && abs_addr >= detected_base_addr)
+                    {
+                        uint32_t offset = abs_addr - detected_base_addr;
+                        if (offset + count < APP_MAX_SIZE) {
+                            for(int i=0; i<count; i++) {
+                                g_app_buffer[offset + i] = Raw_ParseByte(&line_buffer[8+(i*2)]);
+                            }
+                            /* Dosya boyutunu takip et */
+                            if (offset + count > g_app_len) g_app_len = offset + count;
+                        }
+                    }
+                }
+                /* Tip 01: EOF (Dosya Bitti) */
+                else if (type == 0x01) {
+                    goto START_FLASHING;
+                }
+                line_idx = 0;
+            } 
+            else {
+                if (line_idx < 511) line_buffer[line_idx++] = c;
+            }
+        }
+        else
+        {
+            /* Timeout Kontrolü */
+            if (data_started && (HAL_GetTick() - last_rx > 1500)) {
+                /* Veri akışı durduysa bitti kabul et */
+                if(g_app_len > 0) goto START_FLASHING;
+                else {
+                    __enable_irq(); // Hata durumunda kesmeleri aç
+                    printf("\r\n[TIMEOUT] Veri gelmedi.\r\n");
+                    return;
+                }
+            }
+        }
+    }
 
-* **Frekans Limiti:** `ac_signal.c` içindeki `MAX_SAFE_FREQUENCY` (şu anda 2500 Hz) üzerindeki frekans komutları, kilitlenmeyi önlemek için reddedilir.
-* **Gürültü:** Yüksek SPI hızlarında (8Mbit/s) çalışırken, AC kanalının gürültüsü DC kanallarında "titreşim" (0-3mA arası oynama) olarak gözlemlenebilir. Bu bir yazılım hatası değil, donanımsal diyafoni (crosstalk) sorunudur.
+START_FLASHING:
+    /* --- KESMELERİ GERİ AÇ --- */
+    __enable_irq();
+
+    if (g_app_len == 0) {
+        printf("\r\n[HATA] Veri Alinamadi!\r\n");
+        return;
+    }
+
+    printf("\r\n[INFO] Dosya Alindi (%lu bytes). Flash Siliniyor...\r\n", g_app_len);
+    
+    /* 3. FLASH İŞLEMLERİ (Artık acelemiz yok, sakince yapabiliriz) */
+    
+    if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+        printf("\r\n[FAIL] Silme Hatasi!\r\n");
+        return;
+    }
+
+    printf("Yaziliyor...\r\n");
+    
+    /* RAM'den Flash'a Transfer */
+    uint32_t write_addr = target_slot_addr;
+    uint32_t bytes_written = 0;
+
+    while (bytes_written < g_app_len)
+    {
+        uint32_t chunk = 128;
+        if (g_app_len - bytes_written < 128) chunk = g_app_len - bytes_written;
+
+        if (Bootloader_Flash_Write(write_addr, &g_app_buffer[bytes_written], chunk) == 0) {
+            printf("\r\n[FAIL] Yazma Hatasi! Adres: 0x%08X\r\n", (unsigned int)write_addr);
+            return;
+        }
+        write_addr += chunk;
+        bytes_written += chunk;
+        
+        if (bytes_written % 4096 == 0) { printf("."); fflush(stdout); }
+    }
+
+    /* 4. TAMAMLANDI */
+    if (target_slot == SLOT_A_ADDR) Set_Active_Slot(SLOT_A_ACTIVE);
+    else Set_Active_Slot(SLOT_B_ACTIVE);
+
+    printf("\r\n\n" CLR_GREEN "[OK] RAW Yukleme Tamamlandi! Resetleniyor..." CLR_RESET "\r\n");
+    HAL_Delay(1000);
+    HAL_NVIC_SystemReset();
+}
