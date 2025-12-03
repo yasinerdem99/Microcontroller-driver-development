@@ -1,94 +1,219 @@
-/* Standart kütüphaneler */
+/*
+ * Bootloader_raw.c
+ * MODUL: RAW HEX YUKLEME (RAM BUFFER + POLLING)
+ * Yontem: Veriyi once RAM'e kaydeder, sonra Flash'a yazar.
+ * Hizli, Guvenli ve Interrupt gerektirmez.
+ */
+
+#include "Bootloader_raw.h"
+#include "Bootloader_flash.h"
+#include "Bootloader_config.h"
 #include <stdio.h>
-#include <conio.h>
-#include <windows.h>
+#include <string.h>
 
-/* FreeRTOS kütüphaneleri */
-#include "FreeRTOS.h"
-#include "task.h"
-#include "queue.h" /* KUYRUK Kütüphanesi eklendi! */
+extern UART_HandleTypeDef huart3;
 
-/* --------------------------------------------------- */
+/* Slot Fonksiyonları (Global) */
+extern void Set_Active_Slot(uint32_t new_slot_flag);
+extern uint32_t Get_Active_Slot_Addr(void);
 
-/* Kuyruk Tanımlayıcısı (Handle) */
-QueueHandle_t xQueue;
+/* --- RAM BUFFER AYARLARI --- */
+#define RAW_BUFFER_SIZE  48000  // 48KB RAM Ayiriyoruz
+static uint8_t g_raw_buffer[RAW_BUFFER_SIZE];
+static uint32_t g_raw_len = 0;
 
-/* Renk Fonksiyonu */
-void SetColor(int colorCode) {
-    HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
-    SetConsoleTextAttribute(hConsole, colorCode);
+/* --- RENK KODLARI --- */
+#define CLR_RESET   "\033[0m"
+#define CLR_CYAN    "\033[1;96m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_YELLOW  "\033[1;93m"
+
+/* Değişkenler */
+static uint32_t hex_upper_addr_raw = 0;
+
+/* ============================================================ */
+/* YARDIMCI FONKSİYONLAR                                        */
+/* ============================================================ */
+
+static uint8_t Raw_HexCharToByte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
 }
 
-void vBlinkyKeyboardInterruptHandler( void ) {}
-
-/* Görev Fonksiyonları */
-static void prvPingTask( void *pvParameters );
-static void prvPongTask( void *pvParameters );
-
-/* --------------------------------------------------- */
-
-void main_blinky( void )
-{
-    SetColor(15); // Beyaz
-    printf( "\n--- PING PONG (QUEUE) DEMOSU BASLIYOR ---\n\n" );
-
-    /* 1. KUYRUK OLUŞTURMA */
-    /* 5 tane tamsayı (int) tutabilen bir kuyruk oluştur */
-    xQueue = xQueueCreate( 5, sizeof( int ) );
-
-    if( xQueue != NULL )
-    {
-        /* Kuyruk oluştuysa görevleri yarat */
-        
-        /* PING Görevi (Gönderici) */
-        xTaskCreate( prvPingTask, "Ping", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 2, NULL );
-
-        /* PONG Görevi (Alıcı) */
-        xTaskCreate( prvPongTask, "Pong", configMINIMAL_STACK_SIZE, NULL, tskIDLE_PRIORITY + 1, NULL );
-
-        /* Zamanlayıcıyı Başlat */
-        vTaskStartScheduler();
-    }
-    else
-    {
-        printf("Kuyruk olusturulamadi!\n");
-    }
-
-    for( ;; );
+static uint8_t Raw_ParseByte(char* ptr) {
+    return (Raw_HexCharToByte(ptr[0]) << 4) | Raw_HexCharToByte(ptr[1]);
 }
 
-/* --- PING GÖREVİ (Veri Gönderir) --- */
-static void prvPingTask( void *pvParameters )
-{
-    int gonderilenDeger = 100;
-    const TickType_t xDelay = pdMS_TO_TICKS( 1000UL ); // 1 saniye bekle
-
-    for( ;; )
-    {
-        /* Kuyruğa veri gönder (Wait süresi 0) */
-        xQueueSend( xQueue, &gonderilenDeger, 0 );
-
-        SetColor(11); // Açık Mavi
-        printf( "PING >> Veri Gonderildi (%d)\n", gonderilenDeger );
-        
-        gonderilenDeger++; /* Değeri değiştir */
-        vTaskDelay( xDelay );
-    }
-}
-
-/* --- PONG GÖREVİ (Veri Bekler ve Alır) --- */
-static void prvPongTask( void *pvParameters )
-{
-    int alinanDeger;
-
-    for( ;; )
-    {
-        /* Kuyruktan veri gelmesini bekle (portMAX_DELAY = sonsuza kadar bekle) */
-        /* Veri gelince uyanır ve aşağıdaki satıra geçer */
-        if( xQueueReceive( xQueue, &alinanDeger, portMAX_DELAY ) == pdPASS )
-        {
-            SetColor(14); // Sarı
-            printf( "               >> PONG: Veri Alindi (%d)\n", alinanDeger );
+/* Menü Seçimi İçin Satır Okuma */
+static void Raw_Read_Line(char *buffer, uint16_t max_len) {
+    uint16_t index = 0; uint8_t rx_char; memset(buffer, 0, max_len);
+    while(1) {
+        if (HAL_UART_Receive(&huart3, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
+            if (rx_char == '\r' || rx_char == '\n') { printf("\r\n"); buffer[index] = 0; return; }
+            if (index < max_len - 1) {
+                buffer[index++] = rx_char;
+                HAL_UART_Transmit(&huart3, &rx_char, 1, 10);
+            }
         }
     }
+}
+
+static uint8_t Check_Address_Raw(uint32_t addr, uint32_t target_slot) {
+    if (addr >= 0x08000000 && addr < 0x08010000) return 2; // Bootloader
+    if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
+    if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
+    return 0;
+}
+
+/* ============================================================ */
+/* ANA FONKSIYON: RECEIVE RAW HEX FILE                          */
+/* ============================================================ */
+void Receive_Raw_Hex_File(void)
+{
+    char sub_cmd[10];
+    uint32_t target_slot = 0;
+    uint32_t target_slot_addr = 0;
+
+    /* Temizlik */
+    g_raw_len = 0;
+    hex_upper_addr_raw = 0;
+    memset(g_raw_buffer, 0xFF, RAW_BUFFER_SIZE);
+
+    /* 1. SLOT SEÇİMİ */
+    printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
+    fflush(stdout);
+    Raw_Read_Line(sub_cmd, 10);
+
+    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
+        target_slot = SLOT_A_ADDR; target_slot_addr = SLOT_A_ADDR;
+        printf("HEDEF: SLOT A (0x%08X)\r\n", (unsigned int)target_slot_addr);
+    }
+    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
+        target_slot = SLOT_B_ADDR; target_slot_addr = SLOT_B_ADDR;
+        printf("HEDEF: SLOT B (0x%08X)\r\n", (unsigned int)target_slot_addr);
+    }
+    else { printf("\r\nIptal.\r\n"); return; }
+
+    printf("\r\n" CLR_GREEN "[HAZIR] Dosyayi surukleyin... (RAM Modu / Hizli)\r\n" CLR_RESET);
+
+    /* --- 2. VERİ YAKALAMA (HIZLI) --- */
+    /* Kesmeleri kapatıyoruz ki işlemci sadece UART'a odaklansın */
+    __disable_irq();
+
+    uint32_t last_rx = HAL_GetTick();
+    uint8_t data_started = 0;
+
+    while(1)
+    {
+        /* REGISTER POLLING: HAL fonksiyonu kullanmadan direkt donanıma bakıyoruz */
+        /* Bu yöntem çok hızlıdır, veri kaçırmaz */
+        
+        if (__HAL_UART_GET_FLAG(&huart3, UART_FLAG_RXNE))
+        {
+            uint8_t c = (uint8_t)(huart3.Instance->RDR & 0xFF);
+            last_rx = HAL_GetTick();
+            data_started = 1;
+
+            /* Sadece buffer dolana kadar al */
+            if (g_raw_len < RAW_BUFFER_SIZE) {
+                g_raw_buffer[g_raw_len++] = c;
+            }
+        }
+        else
+        {
+            /* Timeout: Veri akışı başladıysa ve 1.5 sn veri gelmezse bitir */
+            if (data_started && (HAL_GetTick() - last_rx > 1500)) {
+                break; 
+            }
+        }
+    }
+
+    /* Kesmeleri geri aç */
+    __enable_irq();
+
+    if (g_raw_len == 0) {
+        printf("\r\n[HATA] Veri gelmedi.\r\n"); return;
+    }
+
+    printf("\r\n[INFO] Alindi: %lu bytes. Cozumleniyor ve Yaziliyor...\r\n", g_raw_len);
+
+    /* --- 3. FLASH SİLME --- */
+    if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+        printf("\r\n[FAIL] Silme Hatasi!\r\n"); return;
+    }
+
+    /* --- 4. PARSE ET VE YAZ --- */
+    char line_buffer[512];
+    uint16_t line_idx = 0;
+    uint32_t current_pos = 0;
+    uint8_t in_line = 0;
+    uint32_t bytes_processed = 0;
+
+    for (current_pos = 0; current_pos < g_raw_len; current_pos++)
+    {
+        char c = g_raw_buffer[current_pos];
+
+        if (c == ':') { in_line = 1; line_idx = 0; line_buffer[line_idx++] = ':'; continue; }
+        if (!in_line) continue;
+
+        if (c == '\r' || c == '\n') 
+        {
+            in_line = 0;
+            line_buffer[line_idx] = '\0';
+
+            /* HEX Parsing */
+            if (line_buffer[0] == ':') 
+            {
+                uint8_t count = Raw_ParseByte(&line_buffer[1]);
+                uint16_t alow = (Raw_ParseByte(&line_buffer[3])<<8)|Raw_ParseByte(&line_buffer[5]);
+                uint8_t type  = Raw_ParseByte(&line_buffer[7]);
+
+                if (type == 0x04) {
+                    hex_upper_addr_raw = (Raw_ParseByte(&line_buffer[9])<<8)|Raw_ParseByte(&line_buffer[11]);
+                }
+                else if (type == 0x00) {
+                    uint32_t current_addr = (hex_upper_addr_raw << 16) | alow;
+
+                    /* Filtre ve Güvenlik */
+                    if (current_addr >= 0x08000000) {
+                        if (Check_Address_Raw(current_addr, target_slot) != 1) {
+                             printf("\r\n[HATA] Adres Uyusmazligi: 0x%08lX\r\n", current_addr);
+                             return;
+                        }
+                        /* Yazma */
+                        if (Bootloader_Flash_Write(current_addr, (uint8_t*)0, 0) == 0) {
+                             // NOT: Burada RAM buffer'dan parse ettiğimiz byte'ları yazmalıyız
+                             // Optimize etmek için byte-byte yazmak yerine
+                             // Blok halinde toplayıp yazabiliriz ama basitlik için tek tek yazıyoruz:
+                             
+                             uint8_t row_data[16]; // Hex satırı max 16 byte veri taşır
+                             for(int k=0; k<count; k++) {
+                                 row_data[k] = Raw_ParseByte(&line_buffer[9+(k*2)]);
+                             }
+                             if(Bootloader_Flash_Write(current_addr, row_data, count) == 0) {
+                                 printf("\r\n[FAIL] Yazma Hatasi!\r\n"); return;
+                             }
+                        }
+                    }
+                }
+            }
+            
+            bytes_processed++;
+            if (bytes_processed % 50 == 0) { printf("."); fflush(stdout); }
+        }
+        else {
+            if (line_idx < 511) line_buffer[line_idx++] = c;
+        }
+    }
+
+    /* 5. BİTİŞ */
+    if (target_slot == SLOT_A_ADDR) Set_Active_Slot(SLOT_A_ACTIVE);
+    else Set_Active_Slot(SLOT_B_ACTIVE);
+
+    printf("\r\n\n" CLR_GREEN "[OK] RAW Yukleme Tamamlandi! Resetleniyor..." CLR_RESET "\r\n");
+    HAL_Delay(1000);
+    HAL_NVIC_SystemReset();
 }
