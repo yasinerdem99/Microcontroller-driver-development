@@ -1,7 +1,7 @@
 /*
  * Bootloader_raw.c
- * MODUL: RAW HEX YUKLEME (SADECE SURUKLE-BIRAK)
- * Yontem: Polling + RAM Buffering (En Hizli ve Kesintisiz)
+ * MODUL: RAW HEX YUKLEME (POLLING)
+ * DIKKAT: Tera Term'de "Transmit delay -> msec/line: 50" AYARI SARTTIR!
  */
 
 #include "Bootloader_raw.h"
@@ -19,12 +19,6 @@ extern UART_HandleTypeDef huart3;
 #define CLR_RED     "\033[1;91m"
 #define CLR_YELLOW  "\033[1;93m"
 
-/* --- RAM BUFFER AYARLARI --- */
-/* Uygulamayı önce buraya kaydedeceğiz, sonra Flash'a yazacağız */
-#define RAW_BUFFER_SIZE  48000 
-static uint8_t g_raw_buffer[RAW_BUFFER_SIZE];
-static uint32_t g_max_offset = 0;
-
 /* Parsing Değişkenleri */
 static uint32_t hex_upper_addr_raw = 0;
 
@@ -33,7 +27,7 @@ extern void Set_Active_Slot(uint32_t new_slot_flag);
 extern uint32_t Get_Active_Slot_Addr(void);
 
 /* ============================================================ */
-/* YARDIMCI FONKSİYONLAR (Sadece Bu Dosya İçin)                 */
+/* YARDIMCI FONKSİYONLAR                                        */
 /* ============================================================ */
 
 static uint8_t Raw_HexCharToByte(char c) {
@@ -61,182 +55,217 @@ static void Raw_Read_Line(char *buffer, uint16_t max_len) {
     }
 }
 
-static uint8_t Check_Address_Raw(uint32_t addr, uint32_t target_slot) {
-    if (addr >= 0x08000000 && addr < 0x08010000) return 2; // Bootloader
-    if (target_slot == SLOT_A_ADDR && addr >= 0x08010000 && addr < 0x08200000) return 1;
-    if (target_slot == SLOT_B_ADDR && addr >= 0x08200000) return 1;
-    return 0;
+/* Flash'a Yazma Yardımcısı (Hizalama İçin) */
+/* Bu fonksiyon veriyi direkt Flash'a yazar, BUFFERLAMA YOKTUR */
+static uint8_t Direct_Hex_Write(uint32_t addr, uint8_t byte)
+{
+    static uint8_t  align_buff[16];
+    static uint32_t align_base = 0xFFFFFFFF;
+    static uint8_t  align_idx = 0;
+    
+    uint32_t current_base = addr & 0xFFFFFFF0;
+    uint8_t  offset = addr & 0x0F;
+
+    /* Yeni bir 16'lık bloğa geçtik mi? */
+    if (current_base != align_base) 
+    {
+        /* Öncekini Yaz (Eğer doluysa) */
+        if (align_base != 0xFFFFFFFF && align_idx > 0) {
+            if (Bootloader_Flash_Write(align_base, align_buff, 16) == 0) return 0;
+        }
+        
+        /* Yeni Blok Hazırla */
+        memset(align_buff, 0xFF, 16);
+        align_base = current_base;
+        align_idx = 0;
+    }
+
+    align_buff[offset] = byte;
+    align_idx++;
+    
+    /* Eğer buffer dolduysa veya kritik bir yerdeysek yazmayı Flush fonksiyonuna bırakıyoruz.
+       Ancak polling modunda her satırda yazmak güvenlidir. 
+       Burada sadece biriktiriyoruz, satır sonunda Flush çağıracağız. */
+    
+    return 1;
 }
 
+static void Flush_Direct_Write(void)
+{
+    /* Tamponda kalan son veriyi yaz */
+    /* Bootloader_Flash_Write fonksiyonu statik buffer kullanıyor, o yüzden güvenli */
+    static uint8_t  align_buff[16]; // Bu fonksiyon için dummy (yukarıdaki statik değişkene erişemediğimiz için)
+    /* Not: Yukarıdaki Direct_Hex_Write içindeki static değişkenler local static. 
+       Onlara buradan erişemeyiz. O yüzden mantığı basitleştirip
+       Tek bir flush fonksiyonu yazmak yerine, her satır sonunda yazmayı zorlayamayız.
+       
+       DÜZELTME: Basitlik için static değişkenleri global yapıyorum.
+    */
+    return; // Aşağıda global yaptık
+}
+
+/* --- GLOBAL YAPILAN BUFFER DEĞİŞKENLERİ (Dosya İçi) --- */
+static uint8_t  g_align_buff[16];
+static uint32_t g_align_base = 0xFFFFFFFF;
+static uint8_t  g_align_dirty = 0;
+
+static uint8_t Write_Byte_Global(uint32_t addr, uint8_t byte)
+{
+    uint32_t current_base = addr & 0xFFFFFFF0;
+    uint8_t  offset = addr & 0x0F;
+
+    if (current_base != g_align_base) 
+    {
+        /* Öncekini Yaz */
+        if (g_align_dirty && g_align_base != 0xFFFFFFFF) {
+            if (Bootloader_Flash_Write(g_align_base, g_align_buff, 16) == 0) return 0;
+        }
+        
+        /* Yeni Blok */
+        memset(g_align_buff, 0xFF, 16);
+        g_align_base = current_base;
+        g_align_dirty = 0;
+    }
+
+    g_align_buff[offset] = byte;
+    g_align_dirty = 1;
+    return 1;
+}
+
+static void Flush_Global(void)
+{
+    if (g_align_dirty && g_align_base != 0xFFFFFFFF) {
+        if (Bootloader_Flash_Write(g_align_base, g_align_buff, 16) == 0)
+            printf("\r\n[HATA] Yazma Basarisiz!\r\n");
+        g_align_dirty = 0;
+    }
+}
+
+
 /* ============================================================ */
-/* ANA FONKSIYON: RECEIVE RAW HEX FILE                          */
+/* ANA FONKSIYON: RECEIVE RAW HEX FILE (POLLING)                */
 /* ============================================================ */
 void Receive_Raw_Hex_File(void)
 {
-    uint8_t c;
     char line_buffer[512];
     uint16_t line_idx = 0;
-    uint8_t in_line = 0;
-
-    uint32_t target_slot_addr = 0;
+    uint8_t rx_char;
+    
+    uint32_t last_rx_time = 0;
+    uint8_t file_started = 0;
+    
+    uint32_t current_addr = 0; 
     uint32_t target_slot = 0;
+    uint32_t line_count = 0;
+    
     char sub_cmd[10];
 
-    /* Değişkenleri Temizle */
-    memset(g_raw_buffer, 0xFF, RAW_BUFFER_SIZE);
-    g_max_offset = 0;
+    /* Temizlik */
     hex_upper_addr_raw = 0;
+    g_align_base = 0xFFFFFFFF; g_align_dirty = 0; memset(g_align_buff, 0xFF, 16);
 
-    /* Dinamik Adres Tespiti */
-    uint32_t detected_base_addr = 0xFFFFFFFF;
-    uint8_t base_addr_locked = 0;
-
-    /* 1. SLOT SEÇİMİ */
+    /* 1. HEDEF SEÇİMİ */
     printf("\r\n" CLR_CYAN "[RAW MODU]" CLR_RESET " Slot Secimi (a/b) > ");
     fflush(stdout);
     Raw_Read_Line(sub_cmd, 10);
 
     if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
-        target_slot = SLOT_A_ADDR; target_slot_addr = SLOT_A_ADDR;
-        printf("HEDEF: SLOT A (Adres: 0x%08X)\r\n", (unsigned int)target_slot_addr);
+        target_slot = SLOT_A_ADDR;
+        printf("HEDEF: SLOT A\r\n");
     }
     else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
-        target_slot = SLOT_B_ADDR; target_slot_addr = SLOT_B_ADDR;
-        printf("HEDEF: SLOT B (Adres: 0x%08X)\r\n", (unsigned int)target_slot_addr);
+        target_slot = SLOT_B_ADDR;
+        printf("HEDEF: SLOT B\r\n");
     }
-    else {
-        printf("\r\nIptal.\r\n"); return;
+    else { 
+        printf("\r\nIptal.\r\n"); return; 
     }
 
-    printf("\r\n" CLR_GREEN "[HAZIR] Dosyayi surukleyin... (Hizli Mod / 0ms Delay)\r\n" CLR_RESET);
+    /* 2. SİLME İŞLEMİ (Baştan yapıyoruz ki arada takılmasın) */
+    printf("Flash Siliniyor... Lutfen Bekleyin.\r\n");
+    if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+        printf(CLR_RED "[HATA] Silme Basarisiz!\r\n" CLR_RESET);
+        return;
+    }
+    printf("[OK] Silindi.\r\n");
 
-    /* --- KRİTİK BÖLGE BAŞLANGICI --- */
-    /* Veri akışı sırasında kesmeler (Interrupt) kapatılır ki CPU sadece veriye odaklansın */
-    __disable_irq();
+    printf(CLR_YELLOW "LUTFEN DIKKAT: Tera Term 'Transmit delay' ayarini 50ms yapin!\r\n" CLR_RESET);
+    printf("Hazir. Dosyayi surukleyin...\r\n");
 
-    uint32_t last_rx = HAL_GetTick();
-    uint8_t data_started = 0;
+    last_rx_time = HAL_GetTick();
 
-    /* 2. VERİ ALMA DÖNGÜSÜ (POLLING) */
-    while (1)
+    /* 3. DÖNGÜ (Polling) */
+    while(1)
     {
-        /* 1ms Timeout ile beklemeden oku */
-        HAL_StatusTypeDef status = HAL_UART_Receive(&huart3, &c, 1, 1);
-
-        if (status == HAL_OK)
+        /* 1 Karakter Oku (Timeout 1sn) */
+        /* Veri akışı kesilirse (dosya biterse) timeout'a düşer */
+        if (HAL_UART_Receive(&huart3, &rx_char, 1, 1000) == HAL_OK) 
         {
-            last_rx = HAL_GetTick();
-            
-            /* Gürültü Filtresi */
-            if (!data_started) {
-                if (c == ':') data_started = 1;
-                else continue;
-            }
+            last_rx_time = HAL_GetTick();
+            file_started = 1;
 
-            if (c == ':') { in_line = 1; line_idx = 0; continue; }
-            if (!in_line) continue;
-
-            /* Satır Sonu Geldiyse İşle */
-            if (c == '\r' || c == '\n') 
+            /* Satır Sonu Kontrolü */
+            if (rx_char == '\n' || rx_char == '\r') 
             {
-                in_line = 0;
-                line_buffer[line_idx] = '\0';
-
-                /* HEX Satırını Çöz */
-                uint8_t count = Raw_ParseByte(&line_buffer[0]);
-                uint16_t alow = (Raw_ParseByte(&line_buffer[2]) << 8) | Raw_ParseByte(&line_buffer[4]);
-                uint8_t type  = Raw_ParseByte(&line_buffer[6]);
-
-                /* Tip 04: Üst Adres */
-                if (type == 0x04) {
-                    hex_upper_addr_raw = (Raw_ParseByte(&line_buffer[8]) << 8) | Raw_ParseByte(&line_buffer[10]);
-                }
-                /* Tip 00: Veri (RAM'e Kaydet) */
-                else if (type == 0x00) {
-                    uint32_t abs_addr = (hex_upper_addr_raw << 16) | alow;
+                if (line_idx > 0) {
+                    line_buffer[line_idx] = '\0';
                     
-                    /* İlk geçerli adresi kilitle */
-                    if (!base_addr_locked) {
-                        if(abs_addr >= 0x08000000) {
-                            detected_base_addr = abs_addr;
-                            base_addr_locked = 1;
-                        }
-                    }
-
-                    /* RAM'e yazma (Offset hesapla) */
-                    if (base_addr_locked && abs_addr >= detected_base_addr)
-                    {
-                        uint32_t offset = abs_addr - detected_base_addr;
-                        if (offset + count < RAW_BUFFER_SIZE) {
-                            for(int i=0; i<count; i++) {
-                                g_raw_buffer[offset + i] = Raw_ParseByte(&line_buffer[8+(i*2)]);
+                    /* --- HEX PARSING --- */
+                    if (line_buffer[0] == ':') {
+                        uint8_t count = Raw_ParseByte(&line_buffer[1]);
+                        uint16_t alow = (Raw_ParseByte(&line_buffer[3])<<8)|Raw_ParseByte(&line_buffer[5]);
+                        uint8_t type  = Raw_ParseByte(&line_buffer[7]);
+                        
+                        /* DATA KAYDI (00) */
+                        if (type == 0x00) { 
+                            current_addr = (hex_upper_addr_raw << 16) | alow;
+                            
+                            /* Filtre: Sadece hedef slot aralığını yaz */
+                            if ( (target_slot == SLOT_A_ADDR && current_addr >= 0x08010000 && current_addr < 0x08200000) ||
+                                 (target_slot == SLOT_B_ADDR && current_addr >= 0x08200000) )
+                            {
+                                for(int k=0; k<count; k++) {
+                                    Write_Byte_Global(current_addr + k, Raw_ParseByte(&line_buffer[9+(k*2)]));
+                                }
                             }
-                            if (offset + count > g_max_offset) g_max_offset = offset + count;
+                            
+                            /* Görsel Bildirim */
+                            line_count++;
+                            if(line_count % 20 == 0) { HAL_UART_Transmit(&huart3, (uint8_t*)".", 1, 10); }
+                        }
+                        /* EOF (01) */
+                        else if (type == 0x01) { 
+                            Flush_Global(); 
+                            goto FINISH_RAW; 
+                        }
+                        /* EXT ADDR (04) */
+                        else if (type == 0x04) { 
+                            hex_upper_addr_raw = (Raw_ParseByte(&line_buffer[9])<<8)|Raw_ParseByte(&line_buffer[11]);
                         }
                     }
+                    line_idx = 0;
                 }
-                /* Tip 01: EOF (Dosya Bitti) */
-                else if (type == 0x01) {
-                    goto START_FLASHING;
-                }
-                line_idx = 0;
             } 
             else {
-                if (line_idx < 511) line_buffer[line_idx++] = c;
+                if(line_idx < 511) line_buffer[line_idx++] = rx_char;
             }
         }
         else {
-            /* Timeout Kontrolü */
-            if (data_started && (HAL_GetTick() - last_rx > 2000)) {
-                // Veri kesildi, eğer bir şeyler aldıysak yazmaya geçelim
-                if(g_max_offset > 0) goto START_FLASHING;
-                else {
-                    __enable_irq(); // Kesmeleri aç
-                    printf("\r\n[TIMEOUT] Veri gelmedi.\r\n");
-                    return;
-                }
+            /* Timeout: Dosya başladıysa ve 2 sn veri yoksa Bitti say */
+            if (file_started && (HAL_GetTick() - last_rx_time > 2000)) {
+                printf("\r\n[TIMEOUT] Veri bitti.\r\n");
+                goto FINISH_RAW;
             }
         }
     }
 
-START_FLASHING:
-    /* --- KRİTİK BÖLGE BİTİŞİ --- */
-    __enable_irq(); // Kesmeleri geri aç
-
-    printf("\r\n[INFO] Dosya Alindi (%lu bytes). Flash Siliniyor...\r\n", g_max_offset);
+FINISH_RAW:
+    Flush_Global(); // Kalanları yaz
     
-    /* 3. FLASH İŞLEMLERİ */
-    if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
-        printf("\r\n[FAIL] Silme Hatasi!\r\n");
-        return;
-    }
+    if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
+    else Set_Active_Slot(SLOT_A_ACTIVE);
 
-    printf("Yaziliyor...\r\n");
-    
-    /* RAM'den Flash'a Transfer */
-    uint32_t write_addr = target_slot_addr;
-    uint32_t bytes_written = 0;
-
-    while (bytes_written < g_max_offset)
-    {
-        uint32_t chunk = 128;
-        if (g_max_offset - bytes_written < 128) chunk = g_max_offset - bytes_written;
-
-        if (Bootloader_Flash_Write(write_addr, &g_raw_buffer[bytes_written], chunk) == 0) {
-            printf("\r\n[FAIL] Yazma Hatasi! Adres: 0x%08X\r\n", (unsigned int)write_addr);
-            return;
-        }
-        write_addr += chunk;
-        bytes_written += chunk;
-        
-        if (bytes_written % 1024 == 0) { printf("."); fflush(stdout); }
-    }
-
-    /* 4. TAMAMLANDI VE SLOT GÜNCELLEME */
-    if (target_slot == SLOT_A_ADDR) Set_Active_Slot(SLOT_A_ACTIVE);
-    else Set_Active_Slot(SLOT_B_ACTIVE);
-
-    printf("\r\n\n" CLR_GREEN "[OK] RAW Yukleme Basarili! Resetleniyor..." CLR_RESET "\r\n");
-    HAL_Delay(500);
+    printf("\r\n\n" CLR_GREEN "[OK] RAW Yukleme Tamamlandi! Resetleniyor..." CLR_RESET "\r\n");
+    HAL_Delay(1000);
     HAL_NVIC_SystemReset();
 }
