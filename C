@@ -1,10 +1,170 @@
-* Incremental Build of configuration Debug for project mcu_boot_u5_bootloader ****
-make -j12 all 
-arm-none-eabi-gcc "../Core/Src/Bootloader_core.c" -mcpu=cortex-m33 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32U5A9xx -c -I../Core/Inc -I../Drivers/STM32U5xx_HAL_Driver/Inc -I../Drivers/STM32U5xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32U5xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/Bootloader_core.d" -MT"Core/Src/Bootloader_core.o" --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -o "Core/Src/Bootloader_core.o"
-arm-none-eabi-gcc -o "mcu_boot_u5_bootloader.elf" @"objects.list"   -mcpu=cortex-m33 -T"C:\Users\stj.yerdem\Desktop\FreeRTOS_Workspace_HALL1\mcu_boot_u5_bootloader\STM32U5A9NJHXQ_FLASH.ld" --specs=nosys.specs -Wl,-Map="mcu_boot_u5_bootloader.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
-C:/ST/STM32CubeIDE_1.19.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344/tools/bin/../lib/gcc/arm-none-eabi/13.3.1/../../../../arm-none-eabi/bin/ld.exe: ./Core/Src/Bootloader_bin.o: in function `Xmodem_Receive_File':
-C:/Users/stj.yerdem/Desktop/FreeRTOS_Workspace_HALL1/mcu_boot_u5_bootloader/Debug/../Core/Src/Bootloader_bin.c:111:(.text.Xmodem_Receive_File+0x1c0): undefined reference to `Calc_CRC16'
-C:/ST/STM32CubeIDE_1.19.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344/tools/bin/../lib/gcc/arm-none-eabi/13.3.1/../../../../arm-none-eabi/bin/ld.exe: C:/Users/stj.yerdem/Desktop/FreeRTOS_Workspace_HALL1/mcu_boot_u5_bootloader/Debug/../Core/Src/Bootloader_bin.c:122:(.text.Xmodem_Receive_File+0x20a): undefined reference to `Verify_Firmware_Address'
-collect2.exe: error: ld returned 1 exit status
-make: *** [makefile:64: mcu_boot_u5_bootloader.elf] Error 1
-"make -j12 all" terminated with exit code 2. Build might be incomplete.
+
+
+#include "Bootloader_bin.h" // Veya Bootloader_bin_raw.h
+#include "Bootloader_flash.h"
+#include "Bootloader_config.h"
+#include <stdio.h>
+#include <string.h>
+
+#define SOH 0x01
+#define EOT 0x04
+#define ACK 0x06
+#define NAK 0x15
+#define CAN 0x18
+#define CHAR_C 'C'
+
+extern UART_HandleTypeDef huart1;
+
+/* Slot Fonksiyonları (Core'dan çağırıyoruz) */
+extern void Set_Active_Slot(uint32_t new_slot_flag);
+extern uint32_t Get_Active_Slot_Addr(void);
+/* Satır okuma (Core'dan çağırıyoruz) */
+extern void CLI_Read_Line(char *buffer, uint16_t max_len);
+
+void Xmodem_Receive_File(void)
+{
+    uint8_t rx_buffer[133];
+    uint8_t packet_number = 1;
+    uint8_t status;
+    uint8_t rx_char;
+    uint8_t first_packet_received = 0;
+    uint32_t target_address = 0;
+
+    /* --- ADIM 1: KULLANICIYA HEDEF SOR --- */
+    uint32_t current_active = Get_Active_Slot_Addr();
+
+    printf("========================================\r\n");
+
+    if (current_active == SLOT_A_ADDR) {
+    	target_address = SLOT_B_ADDR;
+        printf("[BILGI] Mevcut surum: Flash A \r\n");
+        printf("HEDEF: Yeni surum :Flash B (0x%08lX) adresine yuklenecektir\r\n", target_address);
+    }
+    else  {
+    	target_address = SLOT_A_ADDR;
+        printf("[BILGI] Mevcut surum: Flash B \r\n");
+        printf("HEDEF: Yeni surum :Flash A (0x%08lX) adresine yuklenecektir\r\n", target_address);
+    }
+
+    printf("========================================\r\n");
+
+
+
+    printf("Dikkat! Hedef Slot Silinecek. Onayliyor musunuz? (y/n) > \r\n");
+    while(1) {
+        HAL_UART_Receive(&huart1, &rx_char, 1, HAL_MAX_DELAY);
+        if (rx_char == 'y' || rx_char == 'Y') break;
+        if (rx_char == 'n' || rx_char == 'N') { printf("Iptal.\r\n"); return; }
+    }
+
+
+
+    uint32_t write_ptr = target_address;
+
+    /* Handshake */
+    printf("\r\n[HAZIR] Dosya Bekleniyor... (Iptal icin 'e' basin)\r\n");
+
+     uint32_t last_c_time = 0;
+     uint8_t handshake_done = 0;
+
+     while (!handshake_done)
+     {
+         uint32_t current_time = HAL_GetTick();
+
+         /* 1. Saniyede bir 'C' gönder (Arka Planda) */
+         if (current_time - last_c_time > 1000) {
+             uint8_t c = CHAR_C;
+             HAL_UART_Transmit(&huart1, &c, 1, 100);
+             last_c_time = current_time;
+         }
+
+         /* 2. Veri Dinleme (Yanıp sönme kodu SILINDI) */
+         /* Sadece veri gelip gelmediğine bakıyoruz */
+         if (HAL_UART_Receive(&huart1, &status, 1, 10) == HAL_OK)
+         {
+             if (status == 'e' || status == 'E') {
+                 printf("\r\n[IPTAL] Kullanici iptal etti.\r\n");
+                 return;
+             }
+             if (status == SOH) {
+                 handshake_done = 1;
+                 /* Ekrana yazı basmıyoruz, direkt işe koyuluyoruz */
+             }
+         }
+     }
+
+    /* Paket Döngüsü */
+    while (1) {
+        rx_buffer[0] = status;
+
+        if (HAL_UART_Receive(&huart1, &rx_buffer[1], 132, 2000) != HAL_OK) {
+            uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
+            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        if (rx_buffer[1] != packet_number || rx_buffer[2] != (uint8_t)(255 - packet_number)) {
+            uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
+            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        uint16_t received_crc = (rx_buffer[131] << 8) | rx_buffer[132];
+        uint16_t calculated_crc = Calc_CRC16(&rx_buffer[3], 128);
+
+        if (received_crc != calculated_crc) {
+             uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
+             HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        /* --- KONTROL VE SILME --- */
+        if (first_packet_received == 0)
+        {
+            // Kullanıcının seçtiği slota göre dosyayı doğrula
+            if (Verify_Firmware_Address(target_address, rx_buffer) == 0)
+            {
+                uint8_t can = CAN;
+                for(int i=0; i<5; i++) HAL_UART_Transmit(&huart1, &can, 1, 10);
+
+                uint8_t trash;
+                while(HAL_UART_Receive(&huart1, &trash, 1, 50) == HAL_OK); // Çöp temizle
+
+                printf("\r\n\r\n[HATA] SECILEN SLOT ILE DOSYA UYUSMUYOR!\r\n");
+                printf("Islem Iptal Edildi.\r\n");
+                return;
+            }
+
+            printf("[OK] Dosya Uygun. Siliniyor... \r\n");
+
+            if (Bootloader_Flash_Erase_Target_Slot(target_address) == 0) {
+                uint8_t can = CAN; HAL_UART_Transmit(&huart1, &can, 1, 100);
+                printf("\r\n[HATA] Silme basarisiz!\r\n");
+                return;
+            }
+            first_packet_received = 1;
+        }
+
+        /* Yazma */
+        uint8_t ack=ACK, can=CAN;
+        if (Bootloader_Flash_Write(write_ptr, &rx_buffer[3], 128)) {
+            write_ptr += 128;
+            packet_number++;
+            HAL_UART_Transmit(&huart1, &ack, 1, 100);
+        } else {
+            HAL_UART_Transmit(&huart1, &can, 1, 100);
+            printf("\r\nWrite Failed!\r\n");
+            return;
+        }
+
+        /* Bitiş */
+        HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY);
+        if (status == EOT) {
+            HAL_UART_Transmit(&huart1, &ack, 1, 100);
+            printf("\r\nYukleme Basarili!\r\n");
+
+            /* Yukleme yapilan slotu AKTIF olarak işaretle */
+            if (target_address == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
+            else Set_Active_Slot(SLOT_A_ACTIVE);
+
+            return;
+        }
+    }
+}
