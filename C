@@ -1,10 +1,9 @@
 /*
  * Bootloader_bin_raw.c
- * MODUL: RAW BINARY YUKLEME (RAM Buffer + Safe Flash Write)
- * Yontem: Veriyi RAM'e al -> Adresi Kontrol Et -> IRQ Kapat -> Flash'a Yaz -> Reset
+ * FEATURE: Auto Ping-Pong + Polling (0ms) + ADDRESS SECURITY CHECK
  */
 
-#include "Bootloader_raw.h" // Header dosyanın adı neyse onu yaz (örn: Bootloader_bin_raw.h)
+#include "Bootloader_hex_raw.h" // Veya Bootloader_bin_raw.h
 #include "Bootloader_flash.h"
 #include "Bootloader_config.h"
 #include <stdio.h>
@@ -13,7 +12,6 @@
 extern UART_HandleTypeDef huart1;
 
 /* --- RAM BUFFER (256KB) --- */
-/* Uygulama boyutu kadar alan. STM32U5 RAM'i yeterlidir. */
 #define BIN_BUFFER_SIZE  (256 * 1024)
 static uint8_t g_bin_buffer[BIN_BUFFER_SIZE];
 static uint32_t g_bin_len = 0;
@@ -25,180 +23,164 @@ static uint32_t g_bin_len = 0;
 #define CLR_RED     "\033[1;91m"
 #define CLR_YELLOW  "\033[1;93m"
 
-/* Global Slot Fonksiyonları */
+/* Slot Fonksiyonları */
 extern void Set_Active_Slot(uint32_t new_slot_flag);
 extern uint32_t Get_Active_Slot_Addr(void);
-extern void Bootloader_Jump_To_Address(uint32_t jump_addr);
 
-/* ============================================================ */
-/* YARDIMCI FONKSİYONLAR                                        */
-/* ============================================================ */
-
-/* Menü Seçimi İçin Satır Okuma */
-static void Bin_Read_Line(char *buffer, uint16_t max_len) {
-    uint16_t index = 0; uint8_t rx_char; memset(buffer, 0, max_len);
-    while(1) {
-        if (HAL_UART_Receive(&huart1, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
-            if (rx_char == '\r' || rx_char == '\n') { printf("\r\n"); buffer[index] = 0; return; }
-            if (index < max_len - 1) {
-                buffer[index++] = rx_char;
-                HAL_UART_Transmit(&huart1, &rx_char, 1, 10);
-            }
-        }
-    }
-}
+uint8_t rx_char_bin = 0; // Değişken adı karışmasın diye _bin ekledim
 
 /* ============================================================ */
 /* ANA FONKSIYON: RECEIVE RAW BIN FILE                          */
 /* ============================================================ */
 void Receive_Raw_Bin_File(void)
 {
-    uint8_t c;
-    char sub_cmd[10];
     uint32_t target_slot_id = 0;
     uint32_t target_slot_addr = 0;
 
-    /* 1. TEMİZLİK */
+    /* Temizlik */
     g_bin_len = 0;
-    // Buffer'ı sıfırlamaya gerek yok, üzerine yazacağız.
 
-    /* 2. HEDEF SEÇİMİ */
-    printf("\r\n" CLR_CYAN "[RAW BIN MODU]" CLR_RESET " Slot Secimi (a/b) > ");
-    fflush(stdout);
-    Bin_Read_Line(sub_cmd, 10);
+    /* --- 1. OTOMATİK HEDEF SEÇİMİ --- */
+    uint32_t current_active = Get_Active_Slot_Addr();
 
-    if (strcmp(sub_cmd, "a") == 0 || strcmp(sub_cmd, "A") == 0) {
-        target_slot_id = SLOT_A_ADDR; target_slot_addr = SLOT_A_ADDR;
-        printf("HEDEF: SLOT A\r\n");
+    printf("\r\n========================================\r\n");
+    if (current_active == SLOT_A_ADDR) {
+        target_slot_id = SLOT_B_ADDR;
+        target_slot_addr = SLOT_B_ADDR;
+        printf(" [INFO] Mevcut: SLOT A (Aktif)\r\n");
+        printf(" [AUTO] HEDEF : SLOT B (0x%08lX)\r\n", target_slot_addr);
+    } else {
+        target_slot_id = SLOT_A_ADDR;
+        target_slot_addr = SLOT_A_ADDR;
+        printf(" [INFO] Mevcut: SLOT B (Aktif)\r\n");
+        printf(" [AUTO] HEDEF : SLOT A (0x%08lX)\r\n", target_slot_addr);
     }
-    else if (strcmp(sub_cmd, "b") == 0 || strcmp(sub_cmd, "B") == 0) {
-        target_slot_id = SLOT_B_ADDR; target_slot_addr = SLOT_B_ADDR;
-        printf("HEDEF: SLOT B\r\n");
+    printf("========================================\r\n");
+
+    printf("Dikkat! Hedef Slot Silinecek. Onayliyor musunuz? (y/n) > \r\n");
+    while(1) {
+        HAL_UART_Receive(&huart1, &rx_char_bin, 1, HAL_MAX_DELAY);
+        if (rx_char_bin == 'y' || rx_char_bin == 'Y') break;
+        if (rx_char_bin == 'n' || rx_char_bin == 'N') { printf("Iptal.\r\n"); return; }
     }
-    else { printf("\r\nIptal.\r\n"); return; }
 
-    printf("\r\n" CLR_GREEN "[HAZIR] .bin dosyasini surukleyin... (RAM Modu)\r\n" CLR_RESET);
+    printf(CLR_GREEN "[HAZIR] .bin dosyasini surukleyin... (Iptal icin 'e' tuslayin)\r\n" CLR_RESET);
 
-    /* --- 3. VERİ YAKALAMA (POLLING - EN HIZLI) --- */
-    
-    /* Kesmeleri kapatiyoruz ki işlemci sadece UART'a odaklansın */
-    __disable_irq();
-
-    /* UART Hata Bayraklarını Temizle */
-    __HAL_UART_CLEAR_OREFLAG(&huart1);
-    __HAL_UART_CLEAR_NEFLAG(&huart1);
-    __HAL_UART_CLEAR_FEFLAG(&huart1);
-
+    /* --- 2. VERİ YAKALAMA (POLLING) --- */
     uint32_t last_rx = HAL_GetTick();
     uint8_t data_started = 0;
 
     while(1)
     {
-        /* REGISTER LEVEL ACCESS: HAL kullanmadan direkt okuma */
-        if (huart1.Instance->ISR & UART_FLAG_RXNE)
+        if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE))
         {
-            c = (uint8_t)(huart1.Instance->RDR & 0xFF);
-            
+            uint8_t c = (uint8_t)(huart1.Instance->RDR & 0xFF);
+
+            /* İptal Kontrolü */
+            if (!data_started) {
+                if (c == 'e' || c == 'E') {
+                    printf("\r\n" CLR_RED "[IPTAL] Kullanici iptal etti." CLR_RESET "\r\n");
+                    return;
+                }
+                data_started = 1;
+            }
+
             /* RAM'e Kaydet */
             if (g_bin_len < BIN_BUFFER_SIZE) {
                 g_bin_buffer[g_bin_len++] = c;
             }
-            
+
             last_rx = HAL_GetTick();
-            data_started = 1;
         }
         else
         {
-            /* Timeout: Veri başladıysa ve 1.5 sn kesildiyse BITTI */
+            /* Timeout: 1.5 sn */
             if (data_started && (HAL_GetTick() - last_rx > 1500)) {
-                break; 
+                break; // Dosya bitti
             }
         }
     }
 
-    /* Veri alımı bitti, ama kesmeleri hemen açmıyoruz! (Flash yazarken kapalı kalmalı) */
-    /* Sadece printf için kısa süreliğine açabiliriz ama printf kullanmazsak daha güvenli */
-    /* Güvenli olması için kesmeleri açıp printf basıp tekrar kapatacağız */
-    __enable_irq();
-
     if (g_bin_len == 0) {
-        printf("\r\n[HATA] Veri gelmedi.\r\n"); return;
+        return;
     }
 
-    printf("\r\n[INFO] Alindi: %lu Bytes. Kontrol ediliyor...\r\n", g_bin_len);
+    printf("\r\n[INFO] Alindi: %lu Bytes. Analiz ediliyor...\r\n", g_bin_len);
 
-    /* --- 4. GÜVENLİK KONTROLÜ (ADRES) --- */
-    if (g_bin_len > 8) 
+    /* --- 3. GÜVENLİK KONTROLÜ (ADRES) --- */
+    /* Bin dosyasının 4. ile 7. byte'ları Reset Vector (Başlangıç Adresi) dir */
+    if (g_bin_len > 8)
     {
-        uint32_t reset_vector = *((uint32_t*)&g_bin_buffer[4]); // 4. byte'tan başla
-        
-        printf("Dosya Hedef Adresi: 0x%08lX\r\n", reset_vector);
+        /* RAM Buffer'dan adresi oku (Little Endian) */
+        uint32_t reset_vector = 0;
+        reset_vector |= g_bin_buffer[4];
+        reset_vector |= (g_bin_buffer[5] << 8);
+        reset_vector |= (g_bin_buffer[6] << 16);
+        reset_vector |= (g_bin_buffer[7] << 24);
+
+        printf("[ANALIZ] Dosya Reset Vektoru: 0x%08lX\r\n", reset_vector);
 
         /* Bootloader Koruması */
-        if (reset_vector < 0x08010000) {
-            printf(CLR_RED "[HATA] Bootloader dosyasini yuklemeye calisiyorsunuz!\r\n" CLR_RESET);
+        if (reset_vector >= 0x08000000 && reset_vector < 0x08010000) {
+            printf(CLR_RED "[KRITIK] Bootloader dosyasini yuklemeye calisiyorsunuz!\r\n" CLR_RESET);
+            printf("Islem Iptal Edildi.\r\n");
             return;
         }
-        
+
         /* Hedef Slot Kontrolü */
         uint8_t address_ok = 0;
+
         if (target_slot_id == SLOT_A_ADDR) {
+            // Hedef A ise, adres A sınırlarında olmalı
             if (reset_vector >= 0x08010000 && reset_vector < 0x08200000) address_ok = 1;
-        } 
+        }
         else if (target_slot_id == SLOT_B_ADDR) {
+            // Hedef B ise, adres B sınırlarında olmalı
             if (reset_vector >= 0x08200000) address_ok = 1;
         }
 
         if (address_ok == 0) {
-            printf(CLR_RED "[HATA] ADRES UYUSMAZLIGI! Secilen slot ile dosya uyusmuyor.\r\n" CLR_RESET);
-            return;
+            printf("\r\n" CLR_RED "[HATA] ADRES UYUSMAZLIGI!" CLR_RESET "\r\n");
+            printf("Dosya Adresi : 0x%08lX\r\n", reset_vector);
+            printf("Hedef Slot   : 0x%08lX\r\n", target_slot_addr);
+            printf("Bu dosya, secilen slot icin derlenmemis.\r\n");
+            return; // ÇIKIŞ (Silme yapma)
         }
     }
     else {
-        printf(CLR_RED "[HATA] Dosya cok kucuk!\r\n" CLR_RESET);
+        printf(CLR_RED "[HATA] Dosya cok kucuk (Header yok)!\r\n" CLR_RESET);
         return;
     }
 
-    /* --- 5. FLASH SİLME VE YAZMA (KRİTİK BÖLGE) --- */
-    
-    printf("Flash Siliniyor ve Yaziliyor... (Lutfen bekleyin)\r\n");
-    
-    /* DİKKAT: Kesmeleri KAPATIYORUZ! */
-    /* Flash işlemi bitene kadar kimse işlemciyi rahatsız etmemeli */
-    __disable_irq(); 
-
-    /* Silme */
+    /* --- 4. FLASH SİLME (Artık güvenli) --- */
+    printf("Adres Dogru. Flash Siliniyor...\r\n");
     if (Bootloader_Flash_Erase_Target_Slot(target_slot_id) == 0) {
-        __enable_irq();
-        printf("\r\n[FAIL] Silme Hatasi!\r\n"); 
-        return;
+        printf("\r\n" CLR_RED "[FAIL] Silme Hatasi!" CLR_RESET "\r\n"); return;
     }
 
-    /* Yazma */
+    /* --- 5. FLASH YAZMA --- */
+    printf("Yaziliyor...\r\n");
     uint32_t write_addr = target_slot_addr;
     uint32_t bytes_written = 0;
 
     while (bytes_written < g_bin_len)
     {
-        uint32_t chunk = 256;
-        if (g_bin_len - bytes_written < 256) chunk = g_bin_len - bytes_written;
+        uint32_t chunk = 128;
+        if (g_bin_len - bytes_written < 128) chunk = g_bin_len - bytes_written;
 
         if (Bootloader_Flash_Write(write_addr, &g_bin_buffer[bytes_written], chunk) == 0) {
-            __enable_irq();
-            printf("\r\n[FAIL] Yazma Hatasi!\r\n"); 
-            return;
+            printf("\r\n" CLR_RED "[FAIL] Yazma Hatasi!" CLR_RESET "\r\n"); return;
         }
         write_addr += chunk; bytes_written += chunk;
-    }
 
-    /* İşlem Bitti, Kesmeleri Aç */
-    __enable_irq();
+        if (bytes_written % 4096 == 0) { printf("."); fflush(stdout); }
+    }
 
     /* --- 6. BİTİŞ --- */
     if (target_slot_id == SLOT_A_ADDR) Set_Active_Slot(SLOT_A_ACTIVE);
     else Set_Active_Slot(SLOT_B_ACTIVE);
 
-    printf("\r\n" CLR_GREEN "[OK] BIN Yukleme Tamamlandi! Resetleniyor..." CLR_RESET "\r\n");
+    printf("\r\n\n" CLR_GREEN "[OK] BIN Yukleme Tamamlandi! Sistem Resetleniyor..." CLR_RESET "\r\n");
     HAL_Delay(1000);
     HAL_NVIC_SystemReset();
 }
