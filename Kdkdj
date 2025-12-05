@@ -1,1 +1,192 @@
-https://zoom.us/w/99558153868?tk=tWlyzAYUFadxtR54Ex8Oy43aPQNPslGs0bdVuNeKuTE.DQkAAAAXLiDejBZIQnB0Y0xRalF1QzdFV1BpdWFWQ0pnAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&uuid=WN_QsLe3ld9RTW86VFoz8jX_g
+
+/*
+ * Bootloader_bin.c
+ * MODUL: BINARY (.bin) YUKLEME (XMODEM)
+ */
+
+#include "Bootloader_bin.h"
+#include "Bootloader_flash.h"
+#include "Bootloader_config.h"
+#include <stdio.h>
+#include <string.h>
+
+extern UART_HandleTypeDef huart1;
+
+/* Slot Fonksiyonları (Core'dan çağırıyoruz) */
+extern void Set_Active_Slot(uint32_t new_slot_flag);
+extern uint32_t Get_Active_Slot_Addr(void);
+/* Satır okuma (Core'dan çağırıyoruz) */
+extern void CLI_Read_Line(char *buffer, uint16_t max_len);
+
+/* XMODEM Sabitleri */
+#define SOH 0x01
+#define EOT 0x04
+#define ACK 0x06
+#define NAK 0x15
+#define CAN 0x18
+#define CHAR_C 'C'
+
+/* Renkler */
+#define CLR_RESET   "\033[0m"
+#define CLR_RED     "\033[31m"
+#define CLR_GREEN   "\033[32m"
+#define CLR_YELLOW  "\033[33m"
+
+/* ============================================================ */
+/* YARDIMCI FONKSİYONLAR                                        */
+/* ============================================================ */
+
+static uint16_t Calc_CRC16(const uint8_t *data, uint16_t size) {
+    uint16_t crc = 0;
+    while (size--) {
+        crc ^= (*data++) << 8;
+        for (int i = 0; i < 8; i++) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021; else crc = crc << 1;
+        }
+    }
+    return crc;
+}
+
+static uint8_t Verify_Firmware_Address(uint32_t target_slot, uint8_t *data_buffer)
+{
+    /* Binary Dosya: Offset 4-7 = Reset Vector */
+    uint32_t reset_addr = *((uint32_t*)&data_buffer[7]); // 3 (Header) + 4 (Offset)
+
+    printf("\r\n[ANALIZ] Dosya Reset Vektoru: 0x%08lX\r\n", reset_addr);
+
+    if (reset_addr >= 0x08000000 && reset_addr < 0x08010000) {
+         printf(CLR_RED "[UYARI] Bootloader dosyasini yuklemeye calisiyorsunuz!" CLR_RESET "\r\n");
+         return 0;
+    }
+
+    if (target_slot == SLOT_A_ADDR) {
+        if (reset_addr >= 0x08010000 && reset_addr < 0x08200000) return 1;
+    }
+    else if (target_slot == SLOT_B_ADDR) {
+        if (reset_addr >= 0x08200000) return 1;
+    }
+
+    printf(CLR_RED "[UYARI] Dosya adresi Hedef Slot (%s) ile uyuşmuyor!" CLR_RESET "\r\n",
+           (target_slot == SLOT_A_ADDR) ? "A" : "B");
+    return 0;
+}
+
+/* ============================================================ */
+/* ANA FONKSİYON: XMODEM BINARY RECEIVE                         */
+/* ============================================================ */
+void Xmodem_Receive_File(void)
+{
+    uint8_t rx_buffer[133];
+    uint8_t packet_number = 1;
+    uint8_t status;
+    uint8_t xmodem_done = 0;
+
+    uint8_t first_packet_received = 0;
+    uint32_t target_slot = 0;
+    uint32_t write_ptr = 0;
+    char user_response[10];
+
+    /* 1. HEDEF BELİRLEME */
+    uint32_t current_active = Get_Active_Slot_Addr();
+
+    printf("\r\n========================================\r\n");
+    if (current_active == SLOT_A_ADDR) {
+        target_slot = SLOT_B_ADDR;
+        printf(" Mevcut: Flash A (Aktif)\r\n");
+        printf(" HEDEF : Flash B (0x%08lX) adresine yuklenecek.\r\n", target_slot);
+    } else {
+        target_slot = SLOT_A_ADDR;
+        printf(" Mevcut: Flash B (Aktif)\r\n");
+        printf(" HEDEF : Flash A (0x%08lX) adresine yuklenecek.\r\n", target_slot);
+    }
+    printf("========================================\r\n");
+
+    /* 2. ONAY */
+    printf("Onayliyor musunuz? (y/n) > ");
+    fflush(stdout);
+    CLI_Read_Line(user_response, 10);
+
+    if (user_response[0] != 'y' && user_response[0] != 'Y') {
+        printf(CLR_RED "[IPTAL] Islem iptal edildi.\r\n" CLR_RESET);
+        return;
+    }
+
+    printf("\r\n[HAZIR] Dosya bekleniyor (.bin gonderin)...\r\n");
+    write_ptr = target_slot;
+
+    /* Handshake */
+    uint32_t last_c = 0;
+    uint8_t handshake = 0;
+    while (!handshake) {
+        if (HAL_GetTick() - last_c > 1000) {
+            uint8_t c = CHAR_C; HAL_UART_Transmit(&huart1, &c, 1, 100); last_c = HAL_GetTick();
+        }
+        if (HAL_UART_Receive(&huart1, &status, 1, 10) == HAL_OK) {
+            if (status == SOH) handshake = 1;
+            if (status == 'e') { printf("\r\nIptal.\r\n"); return; }
+        }
+    }
+
+    /* Paket Döngüsü */
+    while (!xmodem_done)
+    {
+        rx_buffer[0] = status;
+
+        if (HAL_UART_Receive(&huart1, &rx_buffer[1], 132, 2000) != HAL_OK) {
+            uint8_t n = NAK; HAL_UART_Transmit(&huart1, &n, 1, 100);
+            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        if (rx_buffer[1] != packet_number || rx_buffer[2] != (uint8_t)(255 - packet_number)) {
+            uint8_t n = NAK; HAL_UART_Transmit(&huart1, &n, 1, 100);
+            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        uint16_t rcrc = (rx_buffer[131] << 8) | rx_buffer[132];
+        if (rcrc != Calc_CRC16(&rx_buffer[3], 128)) {
+             uint8_t n = NAK; HAL_UART_Transmit(&huart1, &n, 1, 100);
+             HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        /* İLK PAKET KONTROLÜ */
+        if (first_packet_received == 0)
+        {
+            if (Verify_Firmware_Address(target_slot, rx_buffer) == 0) {
+                uint8_t can = CAN;
+                for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                printf("\r\n" CLR_RED "[HATA] Adres Hatasi! Iptal edildi." CLR_RESET "\r\n");
+                return;
+            }
+
+            printf("[INFO] Adres Dogru. Siliniyor... ");
+            if (Bootloader_Flash_Erase_Target_Slot(target_slot) == 0) {
+                uint8_t can = CAN; HAL_UART_Transmit(&huart1, &can, 1, 100);
+                printf(CLR_RED "[FAIL]\r\n" CLR_RESET); return;
+            }
+            printf(CLR_GREEN "[OK]\r\n" CLR_RESET);
+            printf("Yukleniyor... ");
+            first_packet_received = 1;
+        }
+
+        /* Yazma */
+        if (Bootloader_Flash_Write(write_ptr, &rx_buffer[3], 128)) {
+            write_ptr += 128;
+            packet_number++;
+            uint8_t ack = ACK; HAL_UART_Transmit(&huart1, &ack, 1, 100);
+        } else {
+            uint8_t can = CAN; HAL_UART_Transmit(&huart1, &can, 1, 100);
+            printf(CLR_RED "\r\nWrite Failed!\r\n" CLR_RESET);
+            return;
+        }
+
+        HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY);
+        if (status == EOT) {
+            uint8_t ack = ACK; HAL_UART_Transmit(&huart1, &ack, 1, 100);
+            if (target_slot == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
+            else Set_Active_Slot(SLOT_A_ACTIVE);
+            xmodem_done = 1;
+        }
+    }
+    printf("\r\n" CLR_GREEN "[OK] Yukleme Tamamlandi!" CLR_RESET "\r\n");
+    HAL_Delay(500); HAL_NVIC_SystemReset();
+}
