@@ -42,13 +42,13 @@ static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
     }
 
     printf("[BILGI] Silme basliyor (Toplam %d Sayfa)...\r\n", APP_NUM_PAGES_TO_ERASE);
-    
+
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
     /* --- DÖNGÜ İLE TEK TEK SİLME --- */
     /* Hepsini aynı anda silmek yerine tek tek siliyoruz ki arada WDT besleyelim */
-    
+
     for (uint32_t i = 0; i < APP_NUM_PAGES_TO_ERASE; i++)
     {
         uint32_t CurrentPage = FirstPage + i;
@@ -147,7 +147,7 @@ void Receive_Raw_Bin_File(void)
         }
         else {
             if (data_started && (HAL_GetTick() - last_rx > 1000)) break;
-            
+
             #ifdef HAL_IWDG_MODULE_ENABLED
                if(HAL_GetTick() % 200 == 0) HAL_IWDG_Refresh(&hiwdg);
             #endif
@@ -184,7 +184,7 @@ void Receive_Raw_Bin_File(void)
 
     /* --- YAZMA --- */
     printf("Yaziliyor... Lutfen bekleyin...\r\n");
-    
+
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
@@ -198,7 +198,7 @@ void Receive_Raw_Bin_File(void)
         #endif
 
         /* Yazma sırasında da sadece o anlık kapatıyoruz */
-        __disable_irq();
+        //__disable_irq();
 
         uint32_t write_address = target_slot_addr + current_offset;
         memset(temp_data, 0xFF, 16);
@@ -214,9 +214,9 @@ void Receive_Raw_Bin_File(void)
             printf("\r\n[FAIL] Yazma Hatasi! Kod: 0x%X\r\n", (unsigned int)err);
             return;
         }
-        
-        __enable_irq();
-        current_offset += 16; 
+
+       // __enable_irq();
+        current_offset += 16;
     }
 
     HAL_FLASH_Lock();
@@ -227,5 +227,5 @@ void Receive_Raw_Bin_File(void)
 
     printf("\r\n[OK] Basarili! Resetleniyor...\r\n");
     HAL_Delay(1000);
-    HAL_NVIC_SystemReset();
+    //HAL_NVIC_SystemReset();
 }
