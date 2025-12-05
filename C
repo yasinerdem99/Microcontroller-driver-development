@@ -5,11 +5,6 @@
 #include "main.h"
 #include "stm32u5xx_hal.h"
 
-/* ICACHE Desteği */
-#ifdef HAL_ICACHE_MODULE_ENABLED
-#include "stm32u5xx_hal_icache.h"
-#endif
-
 /* --- AYARLAR --- */
 #define FLASH_BANK2_START_ADDR  0x08200000
 #define APP_NUM_PAGES_TO_ERASE  128
@@ -48,16 +43,22 @@ static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
     }
 
     printf("[BILGI] Flash Siliniyor (Bank: %lu, Page: %lu)...\r\n", BankNumber, StartPage);
-    fflush(stdout); // Buffer'ı boşalt
+    fflush(stdout); // Mesajın gittiğinden emin ol
 
     /* Watchdog'u silme işleminden HEMEN önce besle */
     #ifdef HAL_IWDG_MODULE_ENABLED
         HAL_IWDG_Refresh(&hiwdg);
     #endif
 
+    /* ----------------------------------------------------------- */
+    /* KRİTİK BÖLGE: Kesmeleri Kapat (HardFault Önleme)            */
+    /* Flash silinirken Interrupt gelirse işlemci kilitlenir.      */
+    /* ----------------------------------------------------------- */
+    __disable_irq();
+
     HAL_FLASH_Unlock();
 
-    /* Kritik: Eski hata bayraklarını temizle */
+    /* Eski hata bayraklarını temizle */
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
     EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
@@ -65,20 +66,14 @@ static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
     EraseInitStruct.Page        = StartPage;
     EraseInitStruct.NbPages     = APP_NUM_PAGES_TO_ERASE;
 
-    /* NOT: Dual Bank kullandığın için kesmeleri kapatmana (disable_irq) gerek YOKTUR.
-       Aksi takdirde SysTick durur ve HAL Timeout mekanizması çöker. */
-
-#ifdef HAL_ICACHE_MODULE_ENABLED
-    HAL_ICACHE_Disable();
-#endif
-
     HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
 
-#ifdef HAL_ICACHE_MODULE_ENABLED
-    HAL_ICACHE_Enable();
-#endif
-
     HAL_FLASH_Lock();
+
+    /* ----------------------------------------------------------- */
+    /* İşlem Bitti: Kesmeleri Geri Aç                              */
+    /* ----------------------------------------------------------- */
+    __enable_irq();
 
     if (status != HAL_OK)
     {
@@ -104,7 +99,7 @@ void Receive_Raw_Bin_File(void)
     /* --- Hedef Seçimi --- */
     uint32_t current_active = Get_Active_Slot_Addr();
     printf("\r\n========================================\r\n");
-    /* Slot mantığına göre hedef belirleme */
+    
     if (current_active == SLOT_A_ADDR) {
         target_slot_id = SLOT_B_ADDR; target_slot_addr = SLOT_B_ADDR;
         printf(" [AUTO] HEDEF : SLOT B (0x%08lX)\r\n", target_slot_addr);
@@ -121,7 +116,7 @@ void Receive_Raw_Bin_File(void)
              if (rx_char_bin == 'n' || rx_char_bin == 'N') { printf("Iptal.\r\n"); return; }
         }
         #ifdef HAL_IWDG_MODULE_ENABLED
-            HAL_IWDG_Refresh(&hiwdg); // Beklerken WDT patlamasın
+            HAL_IWDG_Refresh(&hiwdg);
         #endif
     }
 
@@ -148,14 +143,11 @@ void Receive_Raw_Bin_File(void)
         }
         else {
             #ifdef HAL_IWDG_MODULE_ENABLED
-               if(g_bin_len % 1000 == 0) HAL_IWDG_Refresh(&hiwdg); // Veri alırken arada besle
+               if(g_bin_len % 1000 == 0) HAL_IWDG_Refresh(&hiwdg);
             #endif
 
-            /* Veri akışı başladıysa ve 1 sn sessizlik varsa bitir */
+            /* 1 sn sessizlik varsa bitir */
             if (data_started && (HAL_GetTick() - last_rx > 1000)) break;
-
-            /* Veri hiç başlamadıysa ve çok beklediysek timeout (opsiyonel) */
-            // if (!data_started && (HAL_GetTick() - last_rx > 30000)) return;
         }
     }
 
@@ -173,9 +165,7 @@ void Receive_Raw_Bin_File(void)
         }
 
         uint8_t address_ok = 0;
-        /* Slot A hedefliyken vektör A aralığında mı? */
         if (target_slot_id == SLOT_A_ADDR && (reset_vector >= 0x08010000 && reset_vector < 0x08200000)) address_ok = 1;
-        /* Slot B hedefliyken vektör B aralığında mı? */
         else if (target_slot_id == SLOT_B_ADDR && (reset_vector >= 0x08200000)) address_ok = 1;
 
         if (!address_ok) {
@@ -186,7 +176,7 @@ void Receive_Raw_Bin_File(void)
     }
     else { printf("[HATA] Dosya cok kucuk.\r\n"); return; }
 
-    /* --- Silme İşlemi --- */
+    /* --- Silme İşlemi (Güvenli) --- */
     if (Raw_Safe_Flash_Erase(target_slot_id) == 0) return;
 
     /* --- Yazma Başlangıcı --- */
@@ -197,9 +187,9 @@ void Receive_Raw_Bin_File(void)
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
     uint32_t current_offset = 0;
-    /* 16 Byte hizalı buffer */
     uint32_t temp_data[4];
 
+    /* Döngü içinde parça parça (Chunk) yazacağız */
     while (current_offset < g_bin_len)
     {
         #ifdef HAL_IWDG_MODULE_ENABLED
@@ -209,11 +199,11 @@ void Receive_Raw_Bin_File(void)
         uint32_t bytes_left = g_bin_len - current_offset;
         uint32_t current_chunk_size = (bytes_left > WRITE_CHUNK_SIZE) ? WRITE_CHUNK_SIZE : bytes_left;
 
-        /* ICACHE'i kapatıyoruz ama INTERRUPT'ları kapatmıyoruz.
-           U5'te Dual Bank yazma sırasında IRQ açık kalabilir (ve kalmalıdır). */
-        #ifdef HAL_ICACHE_MODULE_ENABLED
-            HAL_ICACHE_Disable();
-        #endif
+        /* --------------------------------------------------------- */
+        /* KRİTİK: Bu Chunk yazılırken kesmeleri kapat               */
+        /* SysTick veya UART interruptları yazma sırasında gelmemeli */
+        /* --------------------------------------------------------- */
+        __disable_irq();
 
         for (uint32_t i = 0; i < current_chunk_size; i += 16)
         {
@@ -227,9 +217,9 @@ void Receive_Raw_Bin_File(void)
             /* QuadWord Yazma (128-bit) */
             if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, write_address, (uint32_t)temp_data) != HAL_OK)
             {
-                #ifdef HAL_ICACHE_MODULE_ENABLED
-                    HAL_ICACHE_Enable();
-                #endif
+                /* Hata durumunda hemen kesmeleri aç, kilitlenme olmasın */
+                __enable_irq();
+
                 uint32_t err = HAL_FLASH_GetError();
                 HAL_FLASH_Lock();
                 printf("\r\n[FAIL] Flash Yazma Hatasi! Kod: 0x%X Adres: 0x%08lX\r\n", (unsigned int)err, write_address);
@@ -237,9 +227,10 @@ void Receive_Raw_Bin_File(void)
             }
         }
 
-        #ifdef HAL_ICACHE_MODULE_ENABLED
-            HAL_ICACHE_Enable();
-        #endif
+        /* --------------------------------------------------------- */
+        /* Chunk bitti: Kesmeleri aç. SysTick, WDT vb. çalışsın      */
+        /* --------------------------------------------------------- */
+        __enable_irq();
 
         current_offset += current_chunk_size;
     }
