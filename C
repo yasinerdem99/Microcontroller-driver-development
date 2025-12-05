@@ -1,34 +1,251 @@
-13:46:21 **** Incremental Build of configuration Debug for project mcu_boot_u5_bootloader ****
-make -j12 all 
-arm-none-eabi-gcc "../Core/Src/Bootloader_bin_raw.c" -mcpu=cortex-m33 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32U5A9xx -c -I../Core/Inc -I../Drivers/STM32U5xx_HAL_Driver/Inc -I../Drivers/STM32U5xx_HAL_Driver/Inc/Legacy -I../Drivers/CMSIS/Device/ST/STM32U5xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/Bootloader_bin_raw.d" -MT"Core/Src/Bootloader_bin_raw.o" --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -o "Core/Src/Bootloader_bin_raw.o"
-../Core/Src/Bootloader_bin_raw.c: In function 'Receive_Raw_Bin_File':
-../Core/Src/Bootloader_bin_raw.c:183:20: error: 'CLR_RED' undeclared (first use in this function); did you mean 'CLEAR_REG'?
-  183 |             printf(CLR_RED "[KRITIK] Bootloader (0x0800xxxx) uzerine yazilamaz!\r\n" CLR_RESET);
-      |                    ^~~~~~~
-      |                    CLEAR_REG
-../Core/Src/Bootloader_bin_raw.c:183:20: note: each undeclared identifier is reported only once for each function it appears in
-../Core/Src/Bootloader_bin_raw.c:183:27: error: expected ')' before string constant
-  183 |             printf(CLR_RED "[KRITIK] Bootloader (0x0800xxxx) uzerine yazilamaz!\r\n" CLR_RESET);
-      |                   ~       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      |                           )
-../Core/Src/Bootloader_bin_raw.c:193:27: error: expected ')' before string constant
-  193 |             printf(CLR_RED "[HATA] Adres Hedefle Uyusmuyor! (Vektor: 0x%08lX)\r\n" CLR_RESET, reset_vector);
-      |                   ~       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      |                           )
-../Core/Src/Bootloader_bin_raw.c:198:26: error: expected ')' before string constant
-  198 |     else { printf(CLR_RED "[HATA] Dosya cok kucuk.\r\n" CLR_RESET); return; }
-      |                  ~       ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      |                          )
-../Core/Src/Bootloader_bin_raw.c:224:26: error: expected ')' before 'CLR_RED'
-  224 |             printf("\r\n" CLR_RED "[FAIL] Yazma Hatasi! Adr: 0x%X" CLR_RESET "\r\n", (unsigned int)write_addr);
-      |                   ~      ^~~~~~~~
-      |                          )
-../Core/Src/Bootloader_bin_raw.c:239:18: error: expected ')' before 'CLR_GREEN'
-  239 |     printf("\r\n" CLR_GREEN "[OK] Basarili! Resetleniyor..." CLR_RESET "\r\n");
-      |           ~      ^~~~~~~~~~
-      |                  )
-make: *** [Core/Src/subdir.mk:52: Core/Src/Bootloader_bin_raw.o] Error 1
-"make -j12 all" terminated with exit code 2. Build might be incomplete.
+/*
+ * Bootloader_core.c
+ * FIX: Safe Boot & Recovery Mode
+ */
 
-13:46:22 Build Failed. 7 errors, 0 warnings. (took 939ms)
+#include "main.h"
+#include <stdio.h>
+#include <string.h>
+#include "Bootloader_flash.h"
+#include "Bootloader_config.h"
+#include "Bootloader_hex.h"
+#include "Bootloader_raw.h"
+#include "Bootloader_bin.h"
 
+extern UART_HandleTypeDef huart1;
+
+#define PROMPT_TEXT     "cboot > "
+#define CMD_BUFFER_LEN  64
+
+/* Renkler */
+#define CLR_RESET   "\033[0m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_YELLOW  "\033[1;93m"
+#define CLR_CYAN    "\033[1;96m"
+#define CLR_BOLD    "\033[1m"
+#define CLR_MAGENTA "\033[35m"
+#define CLR_WHITE   "\033[37m"
+
+#define USER_NAME "yerdem"
+
+/* --- LOGO --- */
+void Bootloader_Print_Logo(void)
+{
+    printf("\033[2J\033[H"); 
+    HAL_Delay(10);
+    printf("\033[5 q"); // Cursor ayarı
+
+    printf(CLR_RED "   (Yildiz Logosu Buraya)   \r\n"); 
+    printf(CLR_WHITE "   HAVELSAN BOOTLOADER      \r\n" CLR_RESET);
+
+    uint32_t active_slot = Get_Active_Slot_Addr();
+
+    printf("\r\n");
+    printf(CLR_CYAN   "   User  : " CLR_WHITE "%s" CLR_RESET "\r\n", USER_NAME);
+    
+    if (active_slot == SLOT_A_ADDR) {
+        printf(CLR_GREEN  "   STATUS: [ AKTIF SLOT: A (0x%08X) ]" CLR_RESET "\r\n", (unsigned int)active_slot);
+    } else {
+        printf(CLR_MAGENTA "   STATUS: [ AKTIF SLOT: B (0x%08X) ]" CLR_RESET "\r\n", (unsigned int)active_slot);
+    }
+    
+    printf("   ------------------------------------------------\r\n");
+}
+
+void Print_Help_Menu(void)
+{
+    printf("Komutlar: help, boot, load_bin, load_hex, load_raw, flash_a, flash_b, reboot\r\n");
+}
+
+void CLI_Read_Line(char *buffer, uint16_t max_len)
+{
+    uint16_t index = 0; uint8_t rx_char; 
+    uint8_t bs[] = {0x08, 0x20, 0x08};
+    memset(buffer, 0, max_len);
+
+    while(1) {
+        if (HAL_UART_Receive(&huart1, &rx_char, 1, HAL_MAX_DELAY) == HAL_OK) {
+            if (rx_char == '\r' || rx_char == '\n') { printf("\r\n"); buffer[index] = 0; return; }
+            else if (rx_char == 0x08 || rx_char == 0x7F) {
+                if (index > 0) { index--; buffer[index] = 0; HAL_UART_Transmit(&huart1, bs, 3, 10); }
+            }
+            else if (index < max_len - 1) {
+                buffer[index++] = rx_char; HAL_UART_Transmit(&huart1, &rx_char, 1, 10);
+            }
+        }
+    }
+}
+
+uint32_t Get_Active_Slot_Addr(void)
+{
+    /* Config sayfasından oku */
+    uint32_t config_val = *(volatile uint32_t*)CONFIG_PAGE_ADDR;
+    
+    /* Eğer Config boşsa veya B ise B dön, yoksa A dön */
+    if (config_val == SLOT_B_ACTIVE) return SLOT_B_ADDR;
+    
+    /* Varsayılan olarak A */
+    return SLOT_A_ADDR;
+}
+
+void Set_Active_Slot(uint32_t new_slot_flag)
+{
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+    /* Config Sayfasını Sil (Tek Sayfa) */
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = FLASH_BANK_1;
+    EraseInitStruct.Page        = (CONFIG_PAGE_ADDR - FLASH_BASE) / 0x2000; // 8KB Page Size
+    EraseInitStruct.NbPages     = 1;
+
+    HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
+
+    /* Yeni Değeri Yaz */
+    uint32_t data_pack[4] = {new_slot_flag, 0, 0, 0};
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)data_pack);
+
+    HAL_FLASH_Lock();
+}
+
+/* ============================================================ */
+/* GÜVENLİ ATLAMA (SAFE JUMP) FONKSİYONU                        */
+/* ============================================================ */
+void Bootloader_Jump_To_Address(uint32_t jump_addr)
+{
+    uint32_t mspValue = *(volatile uint32_t*) jump_addr;
+    uint32_t resetValue = *(volatile uint32_t*) (jump_addr + 4);
+
+    /* 1. Flash Boş mu Kontrolü */
+    if (mspValue == 0xFFFFFFFF) {
+        printf("\r\n" CLR_RED "[HATA] Bu slot bos! (0xFFFFFFFF)" CLR_RESET "\r\n");
+        return;
+    }
+
+    /* 2. Stack Pointer Mantıklı mı? (RAM adresinde olmalı) */
+    /* STM32U5 RAM: 0x20000000 - 0x200C0000 arası */
+    if ((mspValue & 0xFF000000) != 0x20000000) {
+        printf("\r\n" CLR_RED "[KRITIK HATA] Gecersiz Uygulama!" CLR_RESET "\r\n");
+        printf("MSP Degeri: 0x%08lX (RAM adresi degil)\r\n", mspValue);
+        printf("Reset Vektor: 0x%08lX\r\n", resetValue);
+        return;
+    }
+
+    printf("\r\n" CLR_GREEN "[INFO] Gecis yapiliyor: 0x%08lX" CLR_RESET "\r\n", jump_addr);
+    HAL_Delay(100); // UART buffer boşalsın
+
+    /* --- TEMİZLİK --- */
+    
+    /* 1. SysTick Kapat */
+    SysTick->CTRL = 0;
+    SysTick->LOAD = 0;
+    SysTick->VAL  = 0;
+
+    /* 2. Tüm Kesmeleri Kapat (Global) */
+    /* Bu, Application açılana kadar sistemi korur. */
+    /* Application main() başında __enable_irq() yapmak ZORUNDADIR. */
+    __disable_irq();
+
+    /* 3. SCB (System Control Block) Temizliği */
+    /* Vektör tablosunu kaydır */
+    SCB->VTOR = jump_addr;
+
+    /* 4. Atla */
+    void (*app_reset_handler)(void) = (void*) resetValue;
+    
+    __set_MSP(mspValue); // Main Stack Pointer'ı ayarla
+    
+    app_reset_handler(); // Zıpla!
+}
+
+/* ============================================================ */
+/* MENÜ DÖNGÜSÜ (KURTARMA MODU EKLENDİ)                         */
+/* ============================================================ */
+void Bootloader_Menu_Loop(void)
+{
+    char cmd_buffer[CMD_BUFFER_LEN];
+    uint32_t active_slot;
+
+    /* Geri Sayım (Recovery için fırsat) */
+    /* Reset atıldığında 2 saniye bekler. Tuşa basarsan menüde kalır. */
+    /* Basmazsan otomatik başlar. */
+    
+    printf("\r\n========================================\r\n");
+    printf("Bootloader Basliyor... (Durdurmak icin bir tusa basin)\r\n");
+    
+    int abort_boot = 0;
+    for(int i=0; i<20; i++) { // 2 saniye (20 * 100ms)
+        if(__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
+            uint8_t dummy = huart1.Instance->RDR; // Veriyi oku ve yut
+            abort_boot = 1;
+            break;
+        }
+        HAL_Delay(100);
+        if(i % 5 == 0) { printf("."); fflush(stdout); }
+    }
+
+    if (abort_boot == 0) {
+        /* Otomatik Başlatma */
+        active_slot = Get_Active_Slot_Addr();
+        printf("\r\n[AUTO] Otomatik Baslatiliyor: 0x%08lX\r\n", active_slot);
+        Bootloader_Jump_To_Address(active_slot);
+        
+        /* Eğer buraya düştüyse Jump başarısız olmuştur */
+        printf("\r\n[HATA] Otomatik baslatma basarisiz. Menuye donuluyor.\r\n");
+    } else {
+        printf("\r\n[MANUEL] Menuye girildi.\r\n");
+    }
+
+    Bootloader_Print_Logo();
+
+    while(1)
+    {
+        active_slot = Get_Active_Slot_Addr();
+
+        printf(CLR_MAGENTA CLR_BOLD "%s" CLR_RESET, PROMPT_TEXT);
+        fflush(stdout);
+
+        CLI_Read_Line(cmd_buffer, CMD_BUFFER_LEN);
+
+        if (strlen(cmd_buffer) == 0) continue;
+
+        if (strcmp(cmd_buffer, "help") == 0 || strcmp(cmd_buffer, "?") == 0) {
+            Print_Help_Menu();
+        }
+        else if (strcmp(cmd_buffer, "boot") == 0) {
+            printf("Uygulama baslatiliyor...\r\n");
+            Bootloader_Jump_To_Address(active_slot);
+        }
+        else if (strcmp(cmd_buffer, "load_bin") == 0) {
+            Xmodem_Receive_File(); 
+            Bootloader_Print_Logo();
+        }
+        else if (strcmp(cmd_buffer, "load_hex") == 0) {
+             Xmodem_Receive_Hex_File(); 
+             Bootloader_Print_Logo();
+        }
+        else if (strcmp(cmd_buffer, "load_raw") == 0) {
+             Receive_Raw_Hex_File(); 
+             Bootloader_Print_Logo();
+        }
+        else if (strcmp(cmd_buffer, "flash_a") == 0) {
+            Bootloader_Jump_To_Address(SLOT_A_ADDR);
+        }
+        else if (strcmp(cmd_buffer, "flash_b") == 0) {
+            Bootloader_Jump_To_Address(SLOT_B_ADDR);
+        }
+        else if (strcmp(cmd_buffer, "reboot") == 0) {
+            HAL_NVIC_SystemReset();
+        }
+        else if (strcmp(cmd_buffer, "clear") == 0) {
+            Bootloader_Print_Logo();
+        }
+        else {
+            printf(CLR_RED "Bilinmeyen komut\r\n" CLR_RESET);
+        }
+    }
+}
