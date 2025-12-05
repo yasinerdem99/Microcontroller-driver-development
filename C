@@ -5,7 +5,7 @@
 #include "main.h" 
 #include "stm32u5xx_hal.h"
 
-/* ICACHE Desteği */
+/* ICACHE Desteği: Conf dosyasında kapalıysa kod patlamasın diye kontrol ekledik */
 #ifdef HAL_ICACHE_MODULE_ENABLED
 #include "stm32u5xx_hal_icache.h"
 #endif
@@ -14,7 +14,7 @@
 #define FLASH_BANK2_START_ADDR  0x08200000
 #define APP_NUM_PAGES_TO_ERASE  128
 #define BIN_BUFFER_SIZE         (256 * 1024)
-#define WRITE_CHUNK_SIZE        (4096)      /* 4KB'lık bloklar halinde yazar */
+#define WRITE_CHUNK_SIZE        (4096)      /* 4KB'lık büyük bloklar halinde yazar, çok daha güvenlidir */
 
 /* Harici Değişkenler */
 extern UART_HandleTypeDef huart1;
@@ -30,12 +30,8 @@ static uint32_t g_bin_len = 0;
 uint8_t rx_char_bin = 0;
 
 /* ============================================================ */
-/* YARDIMCI FONKSİYONLAR                                        */
+/* YARDIMCI GÜVENLİ SİLME FONKSİYONU                            */
 /* ============================================================ */
-
-/**
-  * @brief  Hedef slotu siler.
-  */
 static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
 {
     FLASH_EraseInitTypeDef EraseInitStruct;
@@ -43,6 +39,7 @@ static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
     uint32_t StartPage;
     uint32_t BankNumber;
 
+    /* Hangi Bank ve Sayfa? */
     if (slot_addr < FLASH_BANK2_START_ADDR) {
         BankNumber = FLASH_BANK_1;
         StartPage = (slot_addr - FLASH_BASE) / FLASH_PAGE_SIZE;
@@ -53,7 +50,7 @@ static uint8_t Raw_Safe_Flash_Erase(uint32_t slot_addr)
 
     printf("[BILGI] Flash Siliniyor (Page %lu)...\r\n", StartPage);
     
-    /* UART Buffer'ın tamamen boşaldığından emin ol */
+    /* ÖNEMLİ: UART Buffer'ın tamamen boşaldığından emin ol. Yoksa kesme kapanınca kilitlenir. */
     fflush(stdout);
     while((huart1.Instance->ISR & UART_FLAG_TC) == 0);
 
@@ -125,7 +122,6 @@ void Receive_Raw_Bin_File(void)
     uint32_t last_rx = HAL_GetTick();
     uint8_t data_started = 0;
 
-    /* UART Polling Loop */
     while(1)
     {
         if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE))
@@ -158,14 +154,11 @@ void Receive_Raw_Bin_File(void)
         }
 
         uint8_t address_ok = 0;
-        /* SLOT A: 0x08010000 - 0x08200000 arası */
         if (target_slot_id == SLOT_A_ADDR && (reset_vector >= 0x08010000 && reset_vector < 0x08200000)) address_ok = 1;
-        /* SLOT B: 0x08200000 sonrası */
         else if (target_slot_id == SLOT_B_ADDR && (reset_vector >= 0x08200000)) address_ok = 1;
 
         if (!address_ok) {
             printf("[HATA] Adres Hedefle Uyusmuyor! (Vektor: 0x%08lX)\r\n", reset_vector);
-            printf("Slot A icin: 0x0801XXXX, Slot B icin: 0x082XXXXX beklenir.\r\n");
             return;
         }
         printf("[OK] Adres Dogru: 0x%08lX\r\n", reset_vector);
@@ -176,18 +169,13 @@ void Receive_Raw_Bin_File(void)
     if (Raw_Safe_Flash_Erase(target_slot_id) == 0) return;
 
     /* --- Yazma Başlangıcı --- */
-    printf("Yaziliyor... Lutfen bekleyin (Bu islem sirasinda cikti verilmez)\r\n");
+    printf("Yaziliyor... (Bu islem sirasinda cikti VERILMEZ)\r\n");
     
-    /* UART'ın tamamen sustuğundan emin ol. Yazarken konuşursak kilitlenir! */
+    /* ÖNEMLİ: UART'ın tamamen sustuğundan emin ol. Yazarken konuşursak kilitlenir! */
     fflush(stdout);
     while((huart1.Instance->ISR & UART_FLAG_TC) == 0);
 
-    /* * STRATEJİ:
-     * 1. Flash kilidini aç.
-     * 2. Büyük bloklar (Chunk) halinde döngüye gir.
-     * 3. Her blokta Interruptları kapat -> Hızlıca yaz -> Interruptları aç -> Watchdog'u besle.
-     * 4. Asla printf kullanma!
-     */
+    /* --- BURADAN SONRA PRINTF YOK --- */
 
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
@@ -197,7 +185,7 @@ void Receive_Raw_Bin_File(void)
 
     while (current_offset < g_bin_len)
     {
-        /* Watchdog Besle (Her blok öncesi) */
+        /* Watchdog Besle (Varsa) - Her blok öncesi sistemi rahatlatır */
         #ifdef HAL_IWDG_MODULE_ENABLED
             HAL_IWDG_Refresh(&hiwdg);
         #endif
@@ -207,6 +195,7 @@ void Receive_Raw_Bin_File(void)
         uint32_t current_chunk_size = (bytes_left > WRITE_CHUNK_SIZE) ? WRITE_CHUNK_SIZE : bytes_left;
 
         /* --- KRİTİK BÖLGE BAŞLANGICI --- */
+        /* Kesmeleri 4KB boyunca kapalı tutuyoruz, her 16 byte'ta aç-kapa yapmıyoruz. Çok daha stabil. */
         __disable_irq();
         #ifdef HAL_ICACHE_MODULE_ENABLED
             HAL_ICACHE_Disable();
@@ -238,6 +227,7 @@ void Receive_Raw_Bin_File(void)
         }
 
         /* --- KRİTİK BÖLGE BİTİŞİ --- */
+        /* 4KB bitti, kesmeleri açıp sistemi nefeslendiriyoruz */
         #ifdef HAL_ICACHE_MODULE_ENABLED
             HAL_ICACHE_Enable();
         #endif
