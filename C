@@ -1,170 +1,102 @@
-
-
-#include "Bootloader_bin.h" // Veya Bootloader_bin_raw.h
 #include "Bootloader_flash.h"
-#include "Bootloader_config.h"
-#include <stdio.h>
 #include <string.h>
+#include <stdio.h>
 
-#define SOH 0x01
-#define EOT 0x04
-#define ACK 0x06
-#define NAK 0x15
-#define CAN 0x18
-#define CHAR_C 'C'
+/* STM32U5A9 (4MB Device) için Bank 2 Başlangıcı */
+#define FLASH_BANK2_START_ADDR  0x08200000
+#define APP_NUM_PAGES_TO_ERASE  128  // 128 Sayfa x 8KB = 1MB Yer Açar
 
-extern UART_HandleTypeDef huart1;
-
-/* Slot Fonksiyonları (Core'dan çağırıyoruz) */
-extern void Set_Active_Slot(uint32_t new_slot_flag);
-extern uint32_t Get_Active_Slot_Addr(void);
-/* Satır okuma (Core'dan çağırıyoruz) */
-extern void CLI_Read_Line(char *buffer, uint16_t max_len);
-
-void Xmodem_Receive_File(void)
+/**
+  * @brief  Flash belleğe veri yazar (DEBUG & ALIGNMENT FIX).
+  */
+/**
+  * @brief  Flash belleğe veri yazar (PAD 0xFF FIX).
+  */
+uint8_t Bootloader_Flash_Write(uint32_t address, uint8_t *data, uint16_t len)
 {
-    uint8_t rx_buffer[133];
-    uint8_t packet_number = 1;
-    uint8_t status;
-    uint8_t rx_char;
-    uint8_t first_packet_received = 0;
-    uint32_t target_address = 0;
+    /* 16 Byte'lık hizalı geçici buffer */
+    uint32_t temp_data[4];
+    uint8_t *temp_byte_ptr = (uint8_t*)temp_data;
 
-    /* --- ADIM 1: KULLANICIYA HEDEF SOR --- */
-    uint32_t current_active = Get_Active_Slot_Addr();
+    /* Hata Bayraklarını Temizle */
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
-    printf("========================================\r\n");
+    HAL_FLASH_Unlock();
 
-    if (current_active == SLOT_A_ADDR) {
-    	target_address = SLOT_B_ADDR;
-        printf("[BILGI] Mevcut surum: Flash A \r\n");
-        printf("HEDEF: Yeni surum :Flash B (0x%08lX) adresine yuklenecektir\r\n", target_address);
-    }
-    else  {
-    	target_address = SLOT_A_ADDR;
-        printf("[BILGI] Mevcut surum: Flash B \r\n");
-        printf("HEDEF: Yeni surum :Flash A (0x%08lX) adresine yuklenecektir\r\n", target_address);
-    }
+    /* Döngü 16'şar byte ilerler */
+    for (int i = 0; i < len; i += 16)
+    {
+        /* 1. Buffer'ı tamamen 0xFF ile doldur (Temizlik) */
+        /* Bu çok önemli! Eğer gelen veri 16 byte'tan azsa, kalanı FF olmalı. */
+        memset(temp_data, 0xFF, 16);
 
-    printf("========================================\r\n");
+        /* 2. Elimizdeki kadar veriyi kopyala */
+        /* Eğer kalan veri 16'dan azsa sadece onu kopyalar */
+        uint16_t copy_len = (len - i) >= 16 ? 16 : (len - i);
+        memcpy(temp_byte_ptr, &data[i], copy_len);
 
+        /* 3. Kesmeleri Kapat ve Yaz */
+        __disable_irq();
+        HAL_StatusTypeDef status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address + i, (uint32_t)temp_data);
+        __enable_irq();
 
-
-    printf("Dikkat! Hedef Slot Silinecek. Onayliyor musunuz? (y/n) > \r\n");
-    while(1) {
-        HAL_UART_Receive(&huart1, &rx_char, 1, HAL_MAX_DELAY);
-        if (rx_char == 'y' || rx_char == 'Y') break;
-        if (rx_char == 'n' || rx_char == 'N') { printf("Iptal.\r\n"); return; }
-    }
-
-
-
-    uint32_t write_ptr = target_address;
-
-    /* Handshake */
-    printf("\r\n[HAZIR] Dosya Bekleniyor... (Iptal icin 'e' basin)\r\n");
-
-     uint32_t last_c_time = 0;
-     uint8_t handshake_done = 0;
-
-     while (!handshake_done)
-     {
-         uint32_t current_time = HAL_GetTick();
-
-         /* 1. Saniyede bir 'C' gönder (Arka Planda) */
-         if (current_time - last_c_time > 1000) {
-             uint8_t c = CHAR_C;
-             HAL_UART_Transmit(&huart1, &c, 1, 100);
-             last_c_time = current_time;
-         }
-
-         /* 2. Veri Dinleme (Yanıp sönme kodu SILINDI) */
-         /* Sadece veri gelip gelmediğine bakıyoruz */
-         if (HAL_UART_Receive(&huart1, &status, 1, 10) == HAL_OK)
-         {
-             if (status == 'e' || status == 'E') {
-                 printf("\r\n[IPTAL] Kullanici iptal etti.\r\n");
-                 return;
-             }
-             if (status == SOH) {
-                 handshake_done = 1;
-                 /* Ekrana yazı basmıyoruz, direkt işe koyuluyoruz */
-             }
-         }
-     }
-
-    /* Paket Döngüsü */
-    while (1) {
-        rx_buffer[0] = status;
-
-        if (HAL_UART_Receive(&huart1, &rx_buffer[1], 132, 2000) != HAL_OK) {
-            uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
-            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        if (rx_buffer[1] != packet_number || rx_buffer[2] != (uint8_t)(255 - packet_number)) {
-            uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
-            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        uint16_t received_crc = (rx_buffer[131] << 8) | rx_buffer[132];
-        uint16_t calculated_crc = Calc_CRC16(&rx_buffer[3], 128);
-
-        if (received_crc != calculated_crc) {
-             uint8_t nack=NAK; HAL_UART_Transmit(&huart1, &nack, 1, 100);
-             HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
-        }
-
-        /* --- KONTROL VE SILME --- */
-        if (first_packet_received == 0)
+        /* Hata Kontrolü */
+        if (status != HAL_OK)
         {
-            // Kullanıcının seçtiği slota göre dosyayı doğrula
-            if (Verify_Firmware_Address(target_address, rx_buffer) == 0)
-            {
-                uint8_t can = CAN;
-                for(int i=0; i<5; i++) HAL_UART_Transmit(&huart1, &can, 1, 10);
-
-                uint8_t trash;
-                while(HAL_UART_Receive(&huart1, &trash, 1, 50) == HAL_OK); // Çöp temizle
-
-                printf("\r\n\r\n[HATA] SECILEN SLOT ILE DOSYA UYUSMUYOR!\r\n");
-                printf("Islem Iptal Edildi.\r\n");
-                return;
-            }
-
-            printf("[OK] Dosya Uygun. Siliniyor... \r\n");
-
-            if (Bootloader_Flash_Erase_Target_Slot(target_address) == 0) {
-                uint8_t can = CAN; HAL_UART_Transmit(&huart1, &can, 1, 100);
-                printf("\r\n[HATA] Silme basarisiz!\r\n");
-                return;
-            }
-            first_packet_received = 1;
-        }
-
-        /* Yazma */
-        uint8_t ack=ACK, can=CAN;
-        if (Bootloader_Flash_Write(write_ptr, &rx_buffer[3], 128)) {
-            write_ptr += 128;
-            packet_number++;
-            HAL_UART_Transmit(&huart1, &ack, 1, 100);
-        } else {
-            HAL_UART_Transmit(&huart1, &can, 1, 100);
-            printf("\r\nWrite Failed!\r\n");
-            return;
-        }
-
-        /* Bitiş */
-        HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY);
-        if (status == EOT) {
-            HAL_UART_Transmit(&huart1, &ack, 1, 100);
-            printf("\r\nYukleme Basarili!\r\n");
-
-            /* Yukleme yapilan slotu AKTIF olarak işaretle */
-            if (target_address == SLOT_B_ADDR) Set_Active_Slot(SLOT_B_ACTIVE);
-            else Set_Active_Slot(SLOT_A_ACTIVE);
-
-            return;
+            uint32_t error_code = HAL_FLASH_GetError();
+            HAL_FLASH_Lock();
+            printf("\r\n[HATA] Yazma Hatasi! Adr: 0x%08lX Err: 0x%X\r\n", address + i, (unsigned int)error_code);
+            return 0;
         }
     }
+
+    HAL_FLASH_Lock();
+    return 1;
+}
+
+/**
+  * @brief  Hedef slota ait sayfaları siler.
+  */
+uint8_t Bootloader_Flash_Erase_Target_Slot(uint32_t slot_addr)
+{
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    uint32_t StartPage;
+    uint32_t BankNumber;
+
+    /* Bank ve Sayfa Tespiti */
+    if (slot_addr < FLASH_BANK2_START_ADDR)
+    {
+        // --- BANK 1 ---
+        BankNumber = FLASH_BANK_1;
+        StartPage = (slot_addr - FLASH_BASE) / FLASH_PAGE_SIZE;
+        printf("[BILGI] Siliniyor: BANK 1, Page %lu\r\n", StartPage);
+    }
+    else
+    {
+        // --- BANK 2 ---
+        BankNumber = FLASH_BANK_2;
+        // Bank 2 Offset Hesabı (Adres - 0x08200000)
+        StartPage = (slot_addr - FLASH_BANK2_START_ADDR) / FLASH_PAGE_SIZE;
+        printf("[BILGI] Siliniyor: BANK 2, Page %lu\r\n", StartPage);
+    }
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS); // Silmeden önce de temizle
+
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = BankNumber;
+    EraseInitStruct.Page        = StartPage;
+    EraseInitStruct.NbPages     = APP_NUM_PAGES_TO_ERASE;
+
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK)
+    {
+        HAL_FLASH_Lock();
+        printf("[HATA] Silme Basarisiz! PageError: %lu\r\n", PageError);
+        return 0;
+    }
+
+    HAL_FLASH_Lock();
+    printf("[BILGI] Silme Tamamlandi.\r\n");
+    return 1;
 }
