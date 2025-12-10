@@ -1,13 +1,257 @@
-#include <stdint.h>
+/*
+ * Bootloader_hex.c
+ * YONTEM: Once Yaz, Sonra Kontrol Et (Download First, Verify Later)
+ */
 
-/* Derleyiciye bu veriyi ".app_version" bolumune koy diyoruz */
-#if defined ( __GNUC__ )
-  #define __SECTION(x) __attribute__((section(x)))
-#else
-  #define __SECTION(x)
-#endif
+#include "Bootloader_hex.h"
+#include "Bootloader_config.h"
+#include <stdio.h>
+#include <string.h>
 
-/* --- SENIN AYARLAYACAGIN VERSIYON --- */
-/* Örn: 0x00010005 -> v1.0.5 */
-/* __attribute__((used)) ile derleyicinin bunu optimize edip silmesini engelliyoruz */
-const uint32_t __SECTION(".app_version") __attribute__((used)) App_Version = 0x00010005;
+extern UART_HandleTypeDef huart1;
+
+/* --- AYARLAR --- */
+#define FLASH_BANK2_START_ADDR  0x08200000
+#define APP_NUM_PAGES_TO_ERASE  128
+#define VERSION_OFFSET          0x400 // Versiyonun durduğu yer
+
+/* Xmodem Sabitleri */
+#define SOH 0x01
+#define EOT 0x04
+#define ACK 0x06
+#define NAK 0x15
+#define CAN 0x18
+#define CHAR_C 'C'
+
+/* Renkler */
+#define CLR_RESET   "\033[0m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_YELLOW  "\033[1;93m"
+
+/* Değişkenler */
+static uint32_t hex_upper_addr = 0;
+static uint8_t  smart_buffer[16];
+static uint32_t smart_base_addr = 0xFFFFFFFF;
+static uint8_t  smart_dirty = 0;
+
+/* Config Yapısı (Yerel Tanim) */
+typedef struct {
+    uint32_t ActiveSlot;
+    uint32_t VersionSlotA;
+    uint32_t VersionSlotB;
+    uint32_t Reserved;
+} Bootloader_Config_Test_t;
+
+static Bootloader_Config_Test_t g_Config;
+
+/* --- FLASH VE YARDIMCI FONKSIYONLAR --- */
+
+static void Read_Config(void) {
+    uint32_t *p = (uint32_t*)CONFIG_PAGE_ADDR;
+    g_Config.ActiveSlot = p[0];
+    g_Config.VersionSlotA = p[1];
+    g_Config.VersionSlotB = p[2];
+    if(g_Config.ActiveSlot == 0xFFFFFFFF) g_Config.ActiveSlot = SLOT_A_ACTIVE;
+}
+
+static void Write_Config_And_Reset(uint32_t new_slot, uint32_t new_ver, uint32_t target_addr) {
+    FLASH_EraseInitTypeDef Ei; uint32_t Pe;
+    
+    /* Config Guncelle */
+    g_Config.ActiveSlot = new_slot;
+    if(target_addr == SLOT_A_ADDR) g_Config.VersionSlotA = new_ver;
+    else g_Config.VersionSlotB = new_ver;
+
+    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    Ei.TypeErase=FLASH_TYPEERASE_PAGES; Ei.NbPages=1;
+    
+    if(CONFIG_PAGE_ADDR < FLASH_BANK2_START_ADDR) { 
+        Ei.Banks=FLASH_BANK_1; Ei.Page=(CONFIG_PAGE_ADDR-FLASH_BASE)/FLASH_PAGE_SIZE; 
+    } else { 
+        Ei.Banks=FLASH_BANK_2; Ei.Page=(CONFIG_PAGE_ADDR-FLASH_BANK2_START_ADDR)/FLASH_PAGE_SIZE; 
+    }
+    
+    HAL_FLASHEx_Erase(&Ei, &Pe);
+    
+    uint32_t d[4] = {g_Config.ActiveSlot, g_Config.VersionSlotA, g_Config.VersionSlotB, 0};
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)d);
+    HAL_FLASH_Lock();
+
+    printf(CLR_GREEN "\r\n[OK] Guncelleme Basarili! Resetleniyor...\r\n" CLR_RESET);
+    HAL_Delay(1000);
+    HAL_NVIC_SystemReset();
+}
+
+static uint8_t Local_Flash_Write(uint32_t address, uint8_t *data, uint16_t len) {
+    uint32_t temp[4];
+    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    for (int i=0; i<len; i+=16) {
+        memset(temp, 0xFF, 16);
+        uint16_t cl = (len-i)>=16 ? 16 : (len-i);
+        memcpy(temp, &data[i], cl);
+        __disable_irq();
+        if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address+i, (uint32_t)temp)!=HAL_OK) { 
+            __enable_irq(); HAL_FLASH_Lock(); return 0; 
+        }
+        __enable_irq();
+    }
+    HAL_FLASH_Lock(); return 1;
+}
+
+static uint8_t Local_Flash_Erase_Target(uint32_t slot) {
+    FLASH_EraseInitTypeDef Ei; uint32_t Pe;
+    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    Ei.TypeErase=FLASH_TYPEERASE_PAGES; Ei.NbPages=APP_NUM_PAGES_TO_ERASE;
+    if(slot < FLASH_BANK2_START_ADDR) { Ei.Banks=FLASH_BANK_1; Ei.Page=(slot-FLASH_BASE)/FLASH_PAGE_SIZE; }
+    else { Ei.Banks=FLASH_BANK_2; Ei.Page=(slot-FLASH_BANK2_START_ADDR)/FLASH_PAGE_SIZE; }
+    if(HAL_FLASHEx_Erase(&Ei, &Pe)!=HAL_OK) { HAL_FLASH_Lock(); return 0; }
+    HAL_FLASH_Lock(); return 1;
+}
+
+static uint8_t HexCharToByte(char c) {
+    if(c>='0'&&c<='9')return c-'0'; if(c>='A'&&c<='F')return c-'A'+10; if(c>='a'&&c<='f')return c-'a'+10; return 0;
+}
+static uint8_t ParseByte(char* ptr) { return (HexCharToByte(ptr[0])<<4)|HexCharToByte(ptr[1]); }
+
+static uint16_t Calc_CRC(const uint8_t *data, int len) {
+    uint16_t c=0; while(len--) { c^=(*data++)<<8; for(int i=0;i<8;i++) c=(c&0x8000)?(c<<1)^0x1021:(c<<1); } return c;
+}
+
+static void Flush_Smart_Buffer(void) {
+    if (smart_dirty && smart_base_addr != 0xFFFFFFFF) {
+        Local_Flash_Write(smart_base_addr, smart_buffer, 16);
+        smart_dirty = 0;
+    }
+}
+
+static void Smart_Write(uint32_t addr, uint8_t byte) {
+    uint32_t base = addr & 0xFFFFFFF0;
+    uint8_t off = addr & 0x0F;
+    if (base != smart_base_addr) {
+        Flush_Smart_Buffer();
+        memset(smart_buffer, 0xFF, 16);
+        smart_base_addr = base;
+        smart_dirty = 0;
+    }
+    smart_buffer[off] = byte;
+    smart_dirty = 1;
+}
+
+/* ============================================================ */
+/* ANA FONKSIYON                                                */
+/* ============================================================ */
+void Xmodem_Receive_Hex_File(void)
+{
+    Read_Config();
+    
+    uint8_t rx_buf[133], status = 0;
+    uint8_t packet=1, done=0, hex_done=0, erased=0;
+    char line[128]; uint8_t lidx=0, inline_f=0;
+    uint32_t total=0;
+
+    /* Resetler */
+    hex_upper_addr=0; smart_base_addr=0xFFFFFFFF; smart_dirty=0; memset(smart_buffer, 0xFF, 16);
+
+    /* Hedef Belirle */
+    uint32_t target_slot = (g_Config.ActiveSlot == SLOT_A_ACTIVE) ? SLOT_B_ADDR : SLOT_A_ADDR;
+
+    printf("\r\n[HEX XMODEM] Hedef: 0x%08lX. Gonderin...\r\n", target_slot);
+
+    /* Handshake */
+    while(1) {
+        uint8_t c = CHAR_C; HAL_UART_Transmit(&huart1, &c, 1, 100);
+        if(HAL_UART_Receive(&huart1, &status, 1, 1000)==HAL_OK && status==SOH) break;
+    }
+
+    /* Veri Al ve Yaz */
+    while(!done) {
+        rx_buf[0]=status;
+        if(HAL_UART_Receive(&huart1, &rx_buf[1], 132, 2000)!=HAL_OK) {
+            uint8_t n=NAK; HAL_UART_Transmit(&huart1, &n, 1, 100); HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+        if(Calc_CRC(&rx_buf[3], 128) != (uint16_t)((rx_buf[131]<<8)|rx_buf[132])) {
+            uint8_t n=NAK; HAL_UART_Transmit(&huart1, &n, 1, 100); HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        }
+
+        if(!erased) {
+            printf("Siliniyor...\r\n");
+            if(!Local_Flash_Erase_Target(target_slot)) { printf("Silme Hatasi\r\n"); return; }
+            erased=1;
+        }
+
+        /* Hex Parse & Write Loop */
+        if(!hex_done) {
+            for(int i=0; i<128; i++) {
+                char c = rx_buf[3+i];
+                if(c==0x1A) continue;
+                if(c==':') { inline_f=1; lidx=0; continue; }
+                
+                if(inline_f) {
+                    if(c=='\r' || c=='\n') {
+                        inline_f=0; line[lidx]=0;
+                        uint8_t cnt = ParseByte(&line[0]);
+                        uint16_t alo = (ParseByte(&line[2])<<8)|ParseByte(&line[4]);
+                        uint8_t typ = ParseByte(&line[6]);
+
+                        if(typ==0x04) hex_upper_addr = (ParseByte(&line[8])<<8)|ParseByte(&line[10]);
+                        else if(typ==0x00) {
+                            uint32_t addr = (hex_upper_addr << 16) | alo;
+                            if(addr < 0x08000000) continue;
+                            for(int k=0; k<cnt; k++) Smart_Write(addr+k, ParseByte(&line[8+(k*2)]));
+                        }
+                        else if(typ==0x01) { Flush_Smart_Buffer(); hex_done=1; }
+                    } else if(lidx<127) line[lidx++]=c;
+                }
+            }
+        }
+
+        uint8_t ack=ACK; HAL_UART_Transmit(&huart1, &ack, 1, 100);
+        packet++;
+        HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY);
+
+        /* --- BITTI (EOT) - SIMDI KONTROL ZAMANI --- */
+        if(status == EOT) {
+            HAL_UART_Transmit(&huart1, &ack, 1, 100);
+            Flush_Smart_Buffer();
+            
+            /* 1. Versiyonu Oku (Flash'tan) */
+            uint32_t *pVer = (uint32_t*)(target_slot + VERSION_OFFSET);
+            uint32_t new_ver = *pVer;
+            uint32_t old_ver = (target_slot==SLOT_A_ADDR) ? g_Config.VersionSlotA : g_Config.VersionSlotB;
+            
+            /* 2. Karsilastir ve Sor */
+            printf("\r\n\r\n=== YUKLEME TAMAMLANDI ===\r\n");
+            printf("Yeni Versiyon: %08lX (v%lu.%lu.%lu)\r\n", new_ver, (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
+            printf("Eski Versiyon: %08lX\r\n", old_ver);
+            
+            if(new_ver == 0xFFFFFFFF) {
+                printf(CLR_YELLOW "[UYARI] Versiyon bilgisi okunamadi! (App'te tanimladin mi?)\r\n" CLR_RESET);
+            }
+
+            if(new_ver > old_ver) printf(CLR_GREEN "Durum: YUKSELTME (Upgrade)\r\n" CLR_RESET);
+            else if(new_ver < old_ver) printf(CLR_RED "Durum: SURUM DUSURME (Downgrade)!\r\n" CLR_RESET);
+            else printf(CLR_YELLOW "Durum: AYNI SURUM (Re-install)\r\n" CLR_RESET);
+
+            printf("Onayliyor musunuz? (e: Evet, h: Hayir) > ");
+            
+            /* 3. Cevap Bekle */
+            while(1) {
+                uint8_t rx;
+                if(HAL_UART_Receive(&huart1, &rx, 1, HAL_MAX_DELAY) == HAL_OK) {
+                    if(rx=='e'||rx=='E') {
+                        /* Onay -> Config Guncelle ve Reset */
+                        uint32_t new_active = (target_slot == SLOT_B_ADDR) ? SLOT_B_ACTIVE : SLOT_A_ACTIVE;
+                        Write_Config_And_Reset(new_active, new_ver, target_slot);
+                        break;
+                    }
+                    if(rx=='h'||rx=='H') {
+                        printf(CLR_RED "\r\n[IPTAL] Yeni surum aktif edilmedi.\r\n" CLR_RESET);
+                        break; 
+                    }
+                }
+            }
+            done = 1;
+        }
+    }
+}
