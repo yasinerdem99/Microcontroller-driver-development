@@ -1,21 +1,42 @@
-/*
- * Bootloader_hex.c
- * YONTEM: Once Yaz, Sonra Kontrol Et (Download First, Verify Later)
+/**
+ * @file    Bootloader_hex_xmodem.c
+ * @author  yerdem
+ * @brief   XMODEM Protokolü ile Intel Hex (.hex) Yükleme Modülü.
+ * @version 1.0
+ * @date    2025-12-09
+ *
+ * @details
+ * Bu modül, seri port üzerinden XMODEM protokolü ile gelen Intel Hex formatındaki
+ * verileri işler. Veriler paket paket alınır, anlık olarak satır satır analiz edilir
+ * (Parsing) ve Flash belleğe yazılır.
+ *
+ * Temel Özellikler:
+ * - Ping-Pong Slot Yönetimi: Otomatik hedef belirleme.
+ * - Xmodem-CRC: Veri bütünlüğü ve paket takibi.
+ * - Intel Hex Parser: ASCII veriyi binary'ye çevirir.
+ * - Smart Buffer: 16-byte hizalama için verileri tamponlar.
+ * - Sıkı Adres Kontrolü: Yanlış slota yazmayı engeller, hata durumunda durdurur.
+ * - Gömülü Flash Sürücüsü: Harici dosya bağımlılığı yoktur.
  */
 
-#include "Bootloader_hex.h"
+#include "Bootloader_hex_xmodem.h"
+
 #include "Bootloader_config.h"
 #include <stdio.h>
 #include <string.h>
 
+/** @brief UART Handle Tanımı */
 extern UART_HandleTypeDef huart1;
 
-/* --- AYARLAR --- */
-#define FLASH_BANK2_START_ADDR  0x08200000
-#define APP_NUM_PAGES_TO_ERASE  128
-#define VERSION_OFFSET          0x400 // Versiyonun durduğu yer
+/* --- CONFIG --- */
 
-/* Xmodem Sabitleri */
+/** @brief Flash Bank 2 Başlangıç Adresi */
+#define FLASH_BANK2_START_ADDR  0x08200000
+
+/** @brief Silinecek Sayfa Sayısı (1MB) */
+#define APP_NUM_PAGES_TO_ERASE  128
+
+/* --- XMODEM SABİTLERİ --- */
 #define SOH 0x01
 #define EOT 0x04
 #define ACK 0x06
@@ -23,235 +44,443 @@ extern UART_HandleTypeDef huart1;
 #define CAN 0x18
 #define CHAR_C 'C'
 
-/* Renkler */
+#define VERSION_OFFSET          0x400
+
+/* --- RENK KODLARI --- */
 #define CLR_RESET   "\033[0m"
+#define CLR_CYAN    "\033[1;96m"
 #define CLR_GREEN   "\033[1;92m"
 #define CLR_RED     "\033[1;91m"
 #define CLR_YELLOW  "\033[1;93m"
 
-/* Değişkenler */
+/* Parsing Degiskenleri */
+
+/** @brief Intel Hex Extended Linear Address (Üst 16-bit) */
 static uint32_t hex_upper_addr = 0;
+
+/** @brief 16-Byte Hizalama Tamponu (Smart Buffer) */
 static uint8_t  smart_buffer[16];
+
+/** @brief Smart Buffer'ın ait olduğu Flash adresi (Hizalı) */
 static uint32_t smart_base_addr = 0xFFFFFFFF;
+
+/** @brief Smart Buffer dolu mu? (Dirty Flag) */
 static uint8_t  smart_dirty = 0;
 
-/* Config Yapısı (Yerel Tanim) */
-typedef struct {
-    uint32_t ActiveSlot;
-    uint32_t VersionSlotA;
-    uint32_t VersionSlotB;
-    uint32_t Reserved;
-} Bootloader_Config_Test_t;
+/* ============================================================ */
+/*               LOCAL FLASH FONKSİYONLARI                      */
+/* ============================================================ */
 
-static Bootloader_Config_Test_t g_Config;
+/**
+ * @brief  Flash belleğe 16-Byte hizalı güvenli yazma yapar.
+ * @note   Padding (0xFF) desteği vardır.
+ *
+ * @param  address  Yazılacak Flash adresi.
+ * @param  data     Veri işaretçisi.
+ * @param  len      Veri uzunluğu.
+ * @retval 1: Başarılı, 0: Hata.
+ */
 
-/* --- FLASH VE YARDIMCI FONKSIYONLAR --- */
+static uint8_t Local_Flash_Write(uint32_t address, uint8_t *data, uint16_t len)
+{
+    uint32_t temp_data[4];
+    uint8_t *temp_byte_ptr = (uint8_t*)temp_data;
 
-static void Read_Config(void) {
-    uint32_t *p = (uint32_t*)CONFIG_PAGE_ADDR;
-    g_Config.ActiveSlot = p[0];
-    g_Config.VersionSlotA = p[1];
-    g_Config.VersionSlotB = p[2];
-    if(g_Config.ActiveSlot == 0xFFFFFFFF) g_Config.ActiveSlot = SLOT_A_ACTIVE;
-}
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    HAL_FLASH_Unlock();
 
-static void Write_Config_And_Reset(uint32_t new_slot, uint32_t new_ver, uint32_t target_addr) {
-    FLASH_EraseInitTypeDef Ei; uint32_t Pe;
-    
-    /* Config Guncelle */
-    g_Config.ActiveSlot = new_slot;
-    if(target_addr == SLOT_A_ADDR) g_Config.VersionSlotA = new_ver;
-    else g_Config.VersionSlotB = new_ver;
+    /* 16 Byte'lık bloklar halinde yaz */
+    for (int i = 0; i < len; i += 16)
+    {
+        /* Buffer'ı temizle (Padding için 0xFF) */
+        memset(temp_data, 0xFF, 16);
 
-    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    Ei.TypeErase=FLASH_TYPEERASE_PAGES; Ei.NbPages=1;
-    
-    if(CONFIG_PAGE_ADDR < FLASH_BANK2_START_ADDR) { 
-        Ei.Banks=FLASH_BANK_1; Ei.Page=(CONFIG_PAGE_ADDR-FLASH_BASE)/FLASH_PAGE_SIZE; 
-    } else { 
-        Ei.Banks=FLASH_BANK_2; Ei.Page=(CONFIG_PAGE_ADDR-FLASH_BANK2_START_ADDR)/FLASH_PAGE_SIZE; 
-    }
-    
-    HAL_FLASHEx_Erase(&Ei, &Pe);
-    
-    uint32_t d[4] = {g_Config.ActiveSlot, g_Config.VersionSlotA, g_Config.VersionSlotB, 0};
-    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)d);
-    HAL_FLASH_Lock();
+        /* Kalan veriyi kopyala */
+        uint16_t copy_len = (len - i) >= 16 ? 16 : (len - i);
+        memcpy(temp_byte_ptr, &data[i], copy_len);
 
-    printf(CLR_GREEN "\r\n[OK] Guncelleme Basarili! Resetleniyor...\r\n" CLR_RESET);
-    HAL_Delay(1000);
-    HAL_NVIC_SystemReset();
-}
-
-static uint8_t Local_Flash_Write(uint32_t address, uint8_t *data, uint16_t len) {
-    uint32_t temp[4];
-    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    for (int i=0; i<len; i+=16) {
-        memset(temp, 0xFF, 16);
-        uint16_t cl = (len-i)>=16 ? 16 : (len-i);
-        memcpy(temp, &data[i], cl);
         __disable_irq();
-        if(HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address+i, (uint32_t)temp)!=HAL_OK) { 
-            __enable_irq(); HAL_FLASH_Lock(); return 0; 
-        }
+        HAL_StatusTypeDef status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address + i, (uint32_t)temp_data);
         __enable_irq();
+
+        if (status != HAL_OK)
+        {
+            HAL_FLASH_Lock();
+            printf(CLR_RED "\r\n[ERROR] Flash Write Error (0x%08lX)\r\n", address + i);
+            return 0;
+        }
     }
-    HAL_FLASH_Lock(); return 1;
+
+    HAL_FLASH_Lock();
+    return 1;
 }
 
-static uint8_t Local_Flash_Erase_Target(uint32_t slot) {
-    FLASH_EraseInitTypeDef Ei; uint32_t Pe;
-    HAL_FLASH_Unlock(); __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
-    Ei.TypeErase=FLASH_TYPEERASE_PAGES; Ei.NbPages=APP_NUM_PAGES_TO_ERASE;
-    if(slot < FLASH_BANK2_START_ADDR) { Ei.Banks=FLASH_BANK_1; Ei.Page=(slot-FLASH_BASE)/FLASH_PAGE_SIZE; }
-    else { Ei.Banks=FLASH_BANK_2; Ei.Page=(slot-FLASH_BANK2_START_ADDR)/FLASH_PAGE_SIZE; }
-    if(HAL_FLASHEx_Erase(&Ei, &Pe)!=HAL_OK) { HAL_FLASH_Lock(); return 0; }
-    HAL_FLASH_Lock(); return 1;
+/**
+ * @brief  Hedef Slot'u siler (Bank 1 veya Bank 2).
+ * @param  slot_addr  Hedef slot başlangıç adresi.
+ * @retval 1: Başarılı, 0: Hata.
+ */
+
+static uint8_t Local_Flash_Erase_Target_Slot(uint32_t slot_addr)
+{
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    uint32_t BankNumber;
+    uint32_t StartPage;
+
+    if (slot_addr < FLASH_BANK2_START_ADDR) {
+        BankNumber = FLASH_BANK_1;
+        StartPage = (slot_addr - FLASH_BASE) / FLASH_PAGE_SIZE;
+        printf(CLR_YELLOW "[INFO] Erasing: Bank 1, Page %lu\r\n", StartPage);
+    } else {
+        BankNumber = FLASH_BANK_2;
+        StartPage = (slot_addr - FLASH_BANK2_START_ADDR) / FLASH_PAGE_SIZE;
+        printf(CLR_YELLOW "[INFO] Erasing: Bank 2, Page %lu\r\n", StartPage);
+    }
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = BankNumber;
+    EraseInitStruct.Page        = StartPage;
+    EraseInitStruct.NbPages     = APP_NUM_PAGES_TO_ERASE;
+
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
+        HAL_FLASH_Lock();
+        printf(CLR_RED "[ERROR] Erase Failed! PageError: %lu\r\n", PageError);
+        return 0;
+    }
+
+    HAL_FLASH_Lock();
+    return 1;
 }
+
+/**
+ * @brief  Aktif slot bilgisini günceller (Config Sayfası).
+ * @param  new_slot_flag  Yeni aktif slot bayrağı.
+ */
+
+static void Local_Set_Active_Slot(uint32_t new_slot_flag)
+{
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    uint32_t BankNumber;
+    uint32_t StartPage;
+
+    /* Config Adresine Gore Bank Secimi */
+    if (CONFIG_PAGE_ADDR < FLASH_BANK2_START_ADDR) {
+        BankNumber = FLASH_BANK_1;
+        StartPage = (CONFIG_PAGE_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
+    } else {
+        BankNumber = FLASH_BANK_2;
+        StartPage = (CONFIG_PAGE_ADDR - FLASH_BANK2_START_ADDR) / FLASH_PAGE_SIZE;
+    }
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = BankNumber;
+    EraseInitStruct.Page        = StartPage;
+    EraseInitStruct.NbPages     = 1;
+
+    HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
+
+    uint32_t data[4] = {new_slot_flag, 0, 0, 0};
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)data);
+
+    HAL_FLASH_Lock();
+}
+
+/** @brief  Şu anki aktif slot adresini okur. */
+
+static uint32_t Local_Get_Active_Slot(void) {
+    uint32_t val = *(volatile uint32_t*)CONFIG_PAGE_ADDR;
+    return (val == SLOT_B_ACTIVE) ? SLOT_B_ADDR : SLOT_A_ADDR;
+}
+
+/* ============================================================ */
+/* YARDIMCI FONKSİYONLAR                                        */
+/* ============================================================ */
+
+/** @brief Hex karakteri byte'a çevirir. */
 
 static uint8_t HexCharToByte(char c) {
-    if(c>='0'&&c<='9')return c-'0'; if(c>='A'&&c<='F')return c-'A'+10; if(c>='a'&&c<='f')return c-'a'+10; return 0;
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
 }
-static uint8_t ParseByte(char* ptr) { return (HexCharToByte(ptr[0])<<4)|HexCharToByte(ptr[1]); }
 
-static uint16_t Calc_CRC(const uint8_t *data, int len) {
-    uint16_t c=0; while(len--) { c^=(*data++)<<8; for(int i=0;i<8;i++) c=(c&0x8000)?(c<<1)^0x1021:(c<<1); } return c;
+/** @brief İki hex karakterden bir byte oluşturur. */
+static uint8_t ParseByte(char* ptr) {
+    return (HexCharToByte(ptr[0]) << 4) | HexCharToByte(ptr[1]);
 }
+
+/** @brief XMODEM CRC-16 Hesaplar (Polinom: 0x1021). */
+
+static uint16_t Calc_CRC16_Hex(const uint8_t *data, uint16_t size) {
+    uint16_t crc = 0;
+    while (size--) {
+        crc ^= (*data++) << 8;
+        for (int i = 0; i < 8; i++) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else crc = crc << 1;
+        }
+    }
+    return crc;
+}
+
+/**
+ * @brief  Smart Buffer'da biriken veriyi Flash'a yazar (Flush).
+ * @details 16-byte dolduğunda veya adres değiştiğinde çağrılır.
+ */
 
 static void Flush_Smart_Buffer(void) {
     if (smart_dirty && smart_base_addr != 0xFFFFFFFF) {
-        Local_Flash_Write(smart_base_addr, smart_buffer, 16);
+        if (Local_Flash_Write(smart_base_addr, smart_buffer, 16) == 0)
+            printf(CLR_RED "\r\n[ERROR] Write Failed!\r\n");
         smart_dirty = 0;
     }
 }
 
-static void Smart_Write(uint32_t addr, uint8_t byte) {
-    uint32_t base = addr & 0xFFFFFFF0;
-    uint8_t off = addr & 0x0F;
-    if (base != smart_base_addr) {
+/**
+ * @brief  Tek bir byte'ı Smart Buffer aracılığıyla Flash'a yazar.
+ * @details
+ * Hex dosyası byte byte gelir. Bu fonksiyon verileri 16-byte'lık
+ * paketler halinde biriktirir ve hizalı bir şekilde Flash'a yazar.
+ *
+ * @param  addr  Yazılacak adres.
+ * @param  byte  Yazılacak veri.
+ */
+
+static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
+    uint32_t aligned_base = addr & 0xFFFFFFF0;
+    uint8_t offset = addr & 0x0F;
+    if (aligned_base != smart_base_addr) {
         Flush_Smart_Buffer();
         memset(smart_buffer, 0xFF, 16);
-        smart_base_addr = base;
+        smart_base_addr = aligned_base;
         smart_dirty = 0;
     }
-    smart_buffer[off] = byte;
+    smart_buffer[offset] = byte;
     smart_dirty = 1;
 }
 
 /* ============================================================ */
-/* ANA FONKSIYON                                                */
+/*                    XMODEM ANA FONKSİYONU                     */
 /* ============================================================ */
+
+/**
+ * @brief  Hex XMODEM Dosya Yükleme İşlemini Başlatır.
+ *
+ * @details
+ * 1. Hedef slotu seçer (Ping-Pong).
+ * 2. Handshake ile XMODEM transferini başlatır.
+ * 3. Gelen paketleri (128 byte) doğrular (Packet ID, CRC).
+ * 4. Paket içindeki ASCII Hex verisini satır satır analiz eder (Parse).
+ * 5. Her satırın adresini kontrol eder (Sıkı Güvenlik).
+ * 6. Doğruysa Smart Buffer üzerinden Flash'a yazar.
+ * 7. Bittiğinde (EOF) slotu değiştirir ve resetler.
+ */
+
 void Xmodem_Receive_Hex_File(void)
 {
-    Read_Config();
-    
-    uint8_t rx_buf[133], status = 0;
-    uint8_t packet=1, done=0, hex_done=0, erased=0;
-    char line[128]; uint8_t lidx=0, inline_f=0;
-    uint32_t total=0;
+    uint8_t rx_buffer[133];
+    uint8_t packet_number = 1;
+    uint8_t status = 0;
+    uint8_t xmodem_done = 0;
+    uint8_t hex_parsing_done = 0;
 
-    /* Resetler */
-    hex_upper_addr=0; smart_base_addr=0xFFFFFFFF; smart_dirty=0; memset(smart_buffer, 0xFF, 16);
+    char line_buffer[128];
+    uint8_t line_idx = 0, in_line = 0;
 
-    /* Hedef Belirle */
-    uint32_t target_slot = (g_Config.ActiveSlot == SLOT_A_ACTIVE) ? SLOT_B_ADDR : SLOT_A_ADDR;
+    uint32_t target_slot = 0;
+    uint8_t is_flash_erased = 0;
+    uint32_t total_bytes = 0;
 
-    printf("\r\n[HEX XMODEM] Hedef: 0x%08lX. Gonderin...\r\n", target_slot);
+    /* Değişkenleri Sıfırla */
+    hex_upper_addr = 0;
+    smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
 
-    /* Handshake */
-    while(1) {
-        uint8_t c = CHAR_C; HAL_UART_Transmit(&huart1, &c, 1, 100);
-        if(HAL_UART_Receive(&huart1, &status, 1, 1000)==HAL_OK && status==SOH) break;
+    /* --- 1. HEDEF BELIRLEME (Ping-Pong) --- */
+    uint32_t current_active = Local_Get_Active_Slot();
+
+    printf("\r\n========================================\r\n");
+    if (current_active == SLOT_A_ADDR) {
+    	target_slot = SLOT_B_ADDR;
+        printf(CLR_YELLOW " [INFO] Current memory: Flash A \r\n");
+        printf(CLR_GREEN  " [AUTO] Target memory: Flash B (0x%08lX) \r\n", target_slot);
+    }
+    else  {
+    	target_slot = SLOT_A_ADDR;
+        printf(CLR_YELLOW " [INFO] Current memory: Flash B \r\n");
+        printf(CLR_GREEN  " [AUTO] Target memory: Flash A (0x%08lX) \r\n", target_slot);
+    }
+    printf("========================================\r\n");
+
+    printf(CLR_RED "Warning! The target Flash will be erased. Do you confirm? (y/n) > \r\n");
+    fflush(stdout);
+    uint8_t confirm_char=0;
+
+    while(1)
+    {
+        if(HAL_UART_Receive(&huart1, &confirm_char, 1, HAL_MAX_DELAY)== HAL_OK)
+        {
+            if(confirm_char == 'y' || confirm_char == 'Y') break;
+            else if(confirm_char == 'n' || confirm_char == 'N') {
+                printf(CLR_RED "[IPTAL] Islem durduruldu.\r\n" CLR_RESET);
+                return;
+            }
+        }
     }
 
-    /* Veri Al ve Yaz */
-    while(!done) {
-        rx_buf[0]=status;
-        if(HAL_UART_Receive(&huart1, &rx_buf[1], 132, 2000)!=HAL_OK) {
-            uint8_t n=NAK; HAL_UART_Transmit(&huart1, &n, 1, 100); HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+    printf("\r\n [READY] Waiting for file... (Press 'e' to cancel)\r\n");
+
+    /* --- 3. HANDSHAKE --- */
+    uint32_t last_c = 0;
+    uint8_t handshake = 0;
+    while (!handshake) {
+        if (HAL_GetTick() - last_c > 1000) {
+            uint8_t c = CHAR_C; HAL_UART_Transmit(&huart1, &c, 1, 100); last_c = HAL_GetTick();
         }
-        if(Calc_CRC(&rx_buf[3], 128) != (uint16_t)((rx_buf[131]<<8)|rx_buf[132])) {
-            uint8_t n=NAK; HAL_UART_Transmit(&huart1, &n, 1, 100); HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
+        if (HAL_UART_Receive(&huart1, &status, 1, 10) == HAL_OK) {
+            if (status == 'e' || status == 'E') { printf(CLR_RED "\r\n [CANCEL] User cancelled.\r\n"); return; }
+            if (status == SOH) handshake = 1;
+        }
+    }
+
+    /* --- 4. PAKET DÖNGÜSÜ --- */
+    while (!xmodem_done)
+    {
+        rx_buffer[0] = status;
+
+        /* Kalan 132 byte'ı oku */
+        if (HAL_UART_Receive(&huart1, &rx_buffer[1], 132, 2000) != HAL_OK) {
+            uint8_t n = NAK; HAL_UART_Transmit(&huart1, &n, 1, 100);
+            HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
         }
 
-        if(!erased) {
-            printf("Siliniyor...\r\n");
-            if(!Local_Flash_Erase_Target(target_slot)) { printf("Silme Hatasi\r\n"); return; }
-            erased=1;
+        /* CRC Kontrol */
+        uint16_t rcrc = (rx_buffer[131] << 8) | rx_buffer[132];
+        if (rcrc != Calc_CRC16_Hex(&rx_buffer[3], 128)) {
+             uint8_t n = NAK; HAL_UART_Transmit(&huart1, &n, 1, 100);
+             HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY); continue;
         }
 
-        /* Hex Parse & Write Loop */
-        if(!hex_done) {
-            for(int i=0; i<128; i++) {
-                char c = rx_buf[3+i];
-                if(c==0x1A) continue;
-                if(c==':') { inline_f=1; lidx=0; continue; }
-                
-                if(inline_f) {
-                    if(c=='\r' || c=='\n') {
-                        inline_f=0; line[lidx]=0;
-                        uint8_t cnt = ParseByte(&line[0]);
-                        uint16_t alo = (ParseByte(&line[2])<<8)|ParseByte(&line[4]);
-                        uint8_t typ = ParseByte(&line[6]);
+        total_bytes += 128;
+        printf("\r[XMODEM] Packet: %3d | Bytes: %lu   ", packet_number, total_bytes);
+        fflush(stdout);
 
-                        if(typ==0x04) hex_upper_addr = (ParseByte(&line[8])<<8)|ParseByte(&line[10]);
-                        else if(typ==0x00) {
-                            uint32_t addr = (hex_upper_addr << 16) | alo;
-                            if(addr < 0x08000000) continue;
-                            for(int k=0; k<cnt; k++) Smart_Write(addr+k, ParseByte(&line[8+(k*2)]));
+        /* HEX Parsing */
+        if (!hex_parsing_done)
+        {
+            for (int i = 0; i < 128; i++)
+            {
+                char c = rx_buffer[3 + i];
+                if (c == 0x1A) continue; // CTRL-Z (EOF)
+                if (c == ':') { in_line = 1; line_idx = 0; continue; }
+
+                if (in_line)
+                {
+                    if (c == '\r' || c == '\n') {
+                        in_line = 0;
+                        line_buffer[line_idx] = '\0';
+
+                        /* Satır Çözümleme */
+                        uint8_t count = ParseByte(&line_buffer[0]);
+                        uint16_t alow = (ParseByte(&line_buffer[2])<<8)|ParseByte(&line_buffer[4]);
+                        uint8_t type  = ParseByte(&line_buffer[6]);
+
+                        /* TYPE 04: Adres Güncelle */
+                        if (type == 0x04) {
+                            hex_upper_addr = (ParseByte(&line_buffer[8])<<8)|ParseByte(&line_buffer[10]);
                         }
-                        else if(typ==0x01) { Flush_Smart_Buffer(); hex_done=1; }
-                    } else if(lidx<127) line[lidx++]=c;
+
+                        /* TYPE 00: Data (Yazma İşlemi) */
+                        else if (type == 0x00) {
+                            uint32_t c_addr = (hex_upper_addr << 16) | alow;
+
+                            /* Filtre: 0x08... dışındakileri yoksay */
+                            if (c_addr < 0x08000000) continue;
+
+                            /* --- GÜVENLİK VE SİLME --- */
+                            if (is_flash_erased == 0)
+                            {
+                                /* --- SLOT UYUMLULUK KONTROLÜ (SIKI KONTROL) --- */
+                                /* Bootloader bölgesi (0x0800xxxx) kontrolü zaten yukarıda yapıldı. */
+                                /* Burada sadece Slot A vs Slot B kontrolü yapacağız. */
+
+                                if (target_slot == SLOT_A_ADDR) {
+                                    /* Hedef A ise, adres Slot B'ye taşmamalı */
+                                    if (c_addr >= SLOT_B_ADDR) {
+                                        uint8_t can = CAN;
+                                        for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                        printf("\r\n\r\n" CLR_RED "[ERROR] Address mismatch!" CLR_RESET "\r\n");
+                                        printf("Received: 0x%08lX -> Target: Flash A (0x%08lX)\r\n", c_addr, target_slot);
+                                        return;
+                                    }
+                                }
+                                else if (target_slot == SLOT_B_ADDR) {
+                                    /* Hedef B ise, adres Slot A'da olmamalı */
+                                    if (c_addr < SLOT_B_ADDR) {
+                                        uint8_t can = CAN;
+                                        for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                        printf("\r\n\r\n" CLR_RED "[ERROR] Address mismatch!" CLR_RESET "\r\n");
+                                        printf("Received: 0x%08lX -> Target: SLOT B (0x%08lX)\r\n", c_addr, target_slot);
+                                        return;
+                                    }
+                                }
+
+                                /* Doğruysa SİL */
+                                printf(CLR_YELLOW "\r\n[INFO] Erasing... "); fflush(stdout);
+                                if (Local_Flash_Erase_Target_Slot(target_slot) == 0) {
+                                    uint8_t can = CAN;
+                                    for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                    printf(CLR_RED "[FAIL]\r\n" CLR_RESET); return;
+                                }
+                                printf(CLR_GREEN "[OK]\r\n" CLR_RESET);
+                                is_flash_erased = 1;
+                            }
+
+                            /* Yazma */
+                            for(int k=0; k<count; k++)
+                                Smart_Hex_Write_Byte(c_addr+k, ParseByte(&line_buffer[8+(k*2)]));
+                        }
+
+                        /* TYPE 01: EOF */
+                        else if (type == 0x01) {
+                            Flush_Smart_Buffer();
+                            hex_parsing_done = 1;
+                        }
+                    }
+                    else if (line_idx < 127) {
+                        line_buffer[line_idx++] = c;
+                    }
                 }
             }
         }
 
-        uint8_t ack=ACK; HAL_UART_Transmit(&huart1, &ack, 1, 100);
-        packet++;
+        uint8_t ack = ACK; HAL_UART_Transmit(&huart1, &ack, 1, 100);
+        packet_number++;
+
+        /* Sonraki Paketi Bekle */
         HAL_UART_Receive(&huart1, &status, 1, HAL_MAX_DELAY);
 
-        /* --- BITTI (EOT) - SIMDI KONTROL ZAMANI --- */
-        if(status == EOT) {
+        if (status == EOT) {
             HAL_UART_Transmit(&huart1, &ack, 1, 100);
-            Flush_Smart_Buffer();
-            
-            /* 1. Versiyonu Oku (Flash'tan) */
-            uint32_t *pVer = (uint32_t*)(target_slot + VERSION_OFFSET);
-            uint32_t new_ver = *pVer;
-            uint32_t old_ver = (target_slot==SLOT_A_ADDR) ? g_Config.VersionSlotA : g_Config.VersionSlotB;
-            
-            /* 2. Karsilastir ve Sor */
-            printf("\r\n\r\n=== YUKLEME TAMAMLANDI ===\r\n");
-            printf("Yeni Versiyon: %08lX (v%lu.%lu.%lu)\r\n", new_ver, (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
-            printf("Eski Versiyon: %08lX\r\n", old_ver);
-            
-            if(new_ver == 0xFFFFFFFF) {
-                printf(CLR_YELLOW "[UYARI] Versiyon bilgisi okunamadi! (App'te tanimladin mi?)\r\n" CLR_RESET);
-            }
+            Flush_Smart_Buffer(); // Kalan son verileri yaz
 
-            if(new_ver > old_ver) printf(CLR_GREEN "Durum: YUKSELTME (Upgrade)\r\n" CLR_RESET);
-            else if(new_ver < old_ver) printf(CLR_RED "Durum: SURUM DUSURME (Downgrade)!\r\n" CLR_RESET);
-            else printf(CLR_YELLOW "Durum: AYNI SURUM (Re-install)\r\n" CLR_RESET);
+            /* Slot Değiştir */
+            if (target_slot == SLOT_A_ADDR) Local_Set_Active_Slot(SLOT_A_ACTIVE);
+            else Local_Set_Active_Slot(SLOT_B_ACTIVE);
 
-            printf("Onayliyor musunuz? (e: Evet, h: Hayir) > ");
-            
-            /* 3. Cevap Bekle */
-            while(1) {
-                uint8_t rx;
-                if(HAL_UART_Receive(&huart1, &rx, 1, HAL_MAX_DELAY) == HAL_OK) {
-                    if(rx=='e'||rx=='E') {
-                        /* Onay -> Config Guncelle ve Reset */
-                        uint32_t new_active = (target_slot == SLOT_B_ADDR) ? SLOT_B_ACTIVE : SLOT_A_ACTIVE;
-                        Write_Config_And_Reset(new_active, new_ver, target_slot);
-                        break;
-                    }
-                    if(rx=='h'||rx=='H') {
-                        printf(CLR_RED "\r\n[IPTAL] Yeni surum aktif edilmedi.\r\n" CLR_RESET);
-                        break; 
-                    }
-                }
-            }
-            done = 1;
+            xmodem_done = 1;
         }
     }
+
+    printf("\r\n\n" CLR_GREEN "[INFO] Operation Successful! Resetting..." CLR_RESET "\r\n");
+    HAL_Delay(1500);
+    HAL_NVIC_SystemReset();
 }
