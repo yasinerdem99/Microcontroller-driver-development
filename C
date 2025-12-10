@@ -1,25 +1,7 @@
-/**
- * @file    App_Version_Info.c
- * @brief   Uygulama Versiyon Bilgisi
- * @details Bu dosya, uygulamanin versiyonunu Flash hafizada sabit bir 
- * adrese (Slot Baslangici + 0x400) yerlestirir.
- */
-
-#include <stdint.h>
-
-/* Derleyiciye bu degiskeni ".app_version" adli ozel bolume koymasini soyluyoruz */
-#if defined ( __GNUC__ )
-  #define __SECTION(x) __attribute__((section(x)))
-#else
-  #define __SECTION(x)
-#endif
-
-/* --- VERSİYON AYARI BURADAN YAPILIR --- */
-/* Format: 0xMMmmRRbb (Major.Minor.Rev.Build) */
-/* Örnek: 0x00010005 -> v1.0.5 */
-
-/* "used" parametresi, kodda kullanilmasa bile derleyicinin bunu silmemesini saglar */
-const uint32_t __SECTION(".app_version") __attribute__((used)) App_Version_Data = 0x00010005;
-
-/* (Opsiyonel) Istersen CRC veya baska metadata ekleyebilirsin */
-// const uint32_t __SECTION(".app_version") __attribute__((used)) App_CRC_Data = 0xFFFFFFFF;
+Incremental Build of configuration Debug for project mcu_boot_u5 ****
+make -j12 all 
+arm-none-eabi-gcc -o "mcu_boot_u5.elf" @"objects.list"   -mcpu=cortex-m33 -T"C:\Users\stj.yerdem\Desktop\FreeRTOS_Workspace_HALL1\mcu_boot_u5\STM32U5A9NJHXQ_FLASH.ld" --specs=nosys.specs -Wl,-Map="mcu_boot_u5.map" -Wl,--gc-sections -static --specs=nano.specs -mfpu=fpv5-sp-d16 -mfloat-abi=hard -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+C:/ST/STM32CubeIDE_1.19.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.0.202411081344/tools/bin/../lib/gcc/arm-none-eabi/13.3.1/../../../../arm-none-eabi/bin/ld.exe:C:\Users\stj.yerdem\Desktop\FreeRTOS_Workspace_HALL1\mcu_boot_u5\STM32U5A9NJHXQ_FLASH.ld:62: syntax error
+collect2.exe: error: ld returned 1 exit status
+make: *** [makefile:70: mcu_boot_u5.elf] Error 1
+"make -j12 all" terminated with exit code 2. Build might be incomplete.
