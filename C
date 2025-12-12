@@ -1,18 +1,18 @@
 /**
  * @file    Bootloader_hex_xmodem.c
  * @author  yerdem
- * @brief   XMODEM Protokolü ile Intel Hex (.hex) Yükleme Modülü (ALL-IN-ONE FINAL)
- * @version 1.7
+ * @brief   XMODEM Hex Yükleme Modülü (SIKI GÜVENLİK & ALL-IN-ONE)
+ * @version 1.8
  * @date    12/12/2025
  *
  * @details
  * MANTIK:
- * 1. Hex verisi parça parça işlenir (Sıralı olmak zorunda değildir).
- * 2. Slot A sınırları dışına taşan veri gelirse anında İPTAL edilir.
- * 3. En düşük adres (Start Addr) ve en yüksek adres (End Addr) takip edilir.
- * 4. Bitişte (EOT):
- * - Eğer en düşük adres 0x08010000 değilse -> HATA (Kod çalışmaz).
- * - Eğer doğruysa -> Kullanıcıya sor -> Backup/Rollback.
+ * 1. Hex verisi satır satır işlenir.
+ * 2. KRİTİK KONTROL: İlk veri satırının adresi 0x08010000 olmak zorundadır.
+ * - Değilse: Flash SİLİNMEZ, işlem ANINDA İPTAL edilir.
+ * 3. Yükleme başarılıysa versiyon sorulur.
+ * - EVET: A -> B (Yedekle) ve Reset.
+ * - HAYIR: B -> A (Geri Yükle) ve Reset.
  */
 
 #include "Bootloader_hex_xmodem.h"
@@ -22,6 +22,7 @@
 
 extern UART_HandleTypeDef huart1;
 
+/* --- AYARLAR --- */
 #define FLASH_BANK2_START_ADDR  0x08200000
 #define APP_NUM_PAGES_TO_ERASE  128
 #define VERSION_OFFSET          0x400
@@ -47,10 +48,7 @@ static uint32_t hex_upper_addr = 0;
 static uint8_t  smart_buffer[16];
 static uint32_t smart_base_addr = 0xFFFFFFFF;
 static uint8_t  smart_dirty = 0;
-
-/* Adres Takip Değişkenleri */
-static uint32_t highest_written_addr = 0; 
-static uint32_t lowest_written_addr = 0xFFFFFFFF;
+static uint32_t highest_written_addr = 0; /* Yedekleme boyutu için */
 
 typedef struct {
     uint32_t ActiveSlot;
@@ -141,7 +139,6 @@ static void Local_Backup_A_to_B(uint32_t fw_size)
     uint8_t buffer[256];
     uint32_t copied = 0;
 
-    /* Güvenlik: Minimum 128KB kopyala */
     if (fw_size < (128*1024)) fw_size = (128*1024);
 
     while (copied < fw_size)
@@ -160,13 +157,13 @@ static void Local_Backup_A_to_B(uint32_t fw_size)
 static void Local_Rollback_B_to_A(void)
 {
     printf(CLR_RED "\r\n[ROLLBACK] Rejecting Update... Restoring OLD version from Backup (B)...\r\n" CLR_RESET);
+    
     if(!Local_Flash_Erase_Slot_A()) { printf("Erase Failed!\r\n"); return; }
 
     uint32_t read_addr = SLOT_B_ADDR;
     uint32_t write_addr = SLOT_A_ADDR;
     uint8_t buffer[256];
     
-    /* B'deki yedeği (1MB varsayılan) geri yüklüyoruz */
     for (int i = 0; i < (1024 * 1024); i += 256) {
         memcpy(buffer, (uint32_t*)read_addr, 256);
         if (!Local_Flash_Write(write_addr, buffer, 256)) {
@@ -240,9 +237,7 @@ static void Flush_Smart_Buffer(void) {
     }
 }
 static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
-    /* İstatistikleri Güncelle */
     if (addr > highest_written_addr) highest_written_addr = addr;
-    if (addr < lowest_written_addr) lowest_written_addr = addr;
 
     uint32_t aligned_base = addr & 0xFFFFFFF0;
     uint8_t offset = addr & 0x0F;
@@ -262,11 +257,9 @@ static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
 
 void Xmodem_Receive_Hex_File(void)
 {
-    /* CONFIG OKU (Sadece eski versiyonu bilmek için) */
+    /* CONFIG OKUMA */
     uint32_t *pConfig = (uint32_t*)CONFIG_PAGE_ADDR;
-    /* Varsayılanları ayarla */
-    if(pConfig[0] == 0xFFFFFFFF) { g_Config.ActiveSlot = SLOT_A_ACTIVE; g_Config.VersionSlotA = 0; }
-    else { g_Config.VersionSlotA = pConfig[1]; }
+    uint32_t old_ver = pConfig[1]; if(old_ver == 0xFFFFFFFF) old_ver = 0;
 
     uint8_t rx_buffer[133];
     uint8_t packet_number = 1;
@@ -283,7 +276,6 @@ void Xmodem_Receive_Hex_File(void)
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
     highest_written_addr = 0;
-    lowest_written_addr = 0xFFFFFFFF;
 
     uint32_t target_slot = SLOT_A_ADDR;
 
@@ -356,22 +348,31 @@ void Xmodem_Receive_Hex_File(void)
                         else if (type == 0x00) {
                             uint32_t c_addr = (hex_upper_addr << 16) | alow;
 
-                            /* KORUMA: Sadece Slot A adresi kabul edilir */
-                            if (c_addr < SLOT_A_ADDR || c_addr >= SLOT_B_ADDR) {
-                                uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
-                                printf("\r\n\r\n" CLR_RED "[ERROR] INVALID ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
-                                printf("Target must be in Slot A Range (0x%08X ...)\r\n", SLOT_A_ADDR);
-                                return;
-                            }
-
+                            /* --- KRİTİK GÜVENLİK KONTROLÜ (FLASH SİLİNMEDEN ÖNCE) --- */
                             if (is_flash_erased == 0) {
-                                printf(CLR_YELLOW "\r\n[INFO] Valid Address Detected. Erasing Slot A... ");
+                                /* 1. Adres Slot A Başlangıcı Değilse -> İPTAL */
+                                if (c_addr != SLOT_A_ADDR) {
+                                    uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                    printf("\r\n\r\n" CLR_RED "[ERROR] INVALID START ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
+                                    printf("Code MUST start at 0x%08X (Slot A Base).\r\n", SLOT_A_ADDR);
+                                    return;
+                                }
+                                
+                                /* 2. Adres Doğruysa -> SİL ve Yazmaya Başla */
+                                printf(CLR_YELLOW "\r\n[INFO] Start Address Valid. Erasing Slot A... ");
                                 if (Local_Flash_Erase_Target_Slot(target_slot) == 0) {
                                     uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
                                     return;
                                 }
                                 printf(CLR_GREEN "[OK]\r\n" CLR_RESET);
                                 is_flash_erased = 1;
+                            }
+
+                            /* Sınır Kontrolü (Slot B'ye Taşma) */
+                            if (c_addr >= SLOT_B_ADDR) {
+                                uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                printf("\r\n\r\n" CLR_RED "[ERROR] ADDR OUT OF BOUNDS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
+                                return;
                             }
 
                             for(int k=0; k<count; k++)
@@ -397,19 +398,12 @@ void Xmodem_Receive_Hex_File(void)
             HAL_UART_Transmit(&huart1, &ack, 1, 100);
             Flush_Smart_Buffer();
 
-            /* --- KRİTİK BAŞLANGIÇ ADRESİ KONTROLÜ (BİTİŞTE YAPILIR) --- */
-            /* En düşük adres 0x08010000 DEĞİLSE, kod yanlış yere yazılmıştır */
-            if (lowest_written_addr != SLOT_A_ADDR) {
-                 printf("\r\n\r\n" CLR_RED "[ERROR] CRITICAL: Code does NOT start at Slot A Base (0x%08X)!" CLR_RESET "\r\n", SLOT_A_ADDR);
-                 printf(CLR_YELLOW "Detected Start Address: 0x%08lX\r\n" CLR_RESET, lowest_written_addr);
-                 printf(CLR_RED "Operation Failed. System will NOT reset.\r\n" CLR_RESET);
-                 return;
-            }
-
-            /* --- VERSİYON KONTROL VE KARAR AŞAMASI --- */
+            /* =============================================== */
+            /* VERSİYON KONTROL VE KARAR AŞAMASI               */
+            /* =============================================== */
+            
             uint32_t *pNewApp = (uint32_t*)(SLOT_A_ADDR + VERSION_OFFSET);
             uint32_t new_ver = *pNewApp;
-            uint32_t old_ver = g_Config.VersionSlotA;
 
             printf("\r\n\r\n========================================\r\n");
             printf(      "          VERSION CONTROL               \r\n");
@@ -460,5 +454,3 @@ void Xmodem_Receive_Hex_File(void)
         }
     }
 }
-
-
