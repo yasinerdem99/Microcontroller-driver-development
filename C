@@ -1,16 +1,15 @@
 /**
  * @file    Bootloader_hex_xmodem.c
  * @author  yerdem
- * @brief   XMODEM Protokolü ile Intel Hex (.hex) Yükleme Modülü (Active/Backup).
- * @version 1.4
+ * @brief   XMODEM Protokolü ile Intel Hex (.hex) Yükleme Modülü (Strict & Auto).
+ * @version 1.5
  * @date    2025-12-12
  *
  * @details
- * GÜNCELLEME (v1.4):
- * 1. "LOWEST ADDRESS" KONTROLÜ: Dosyanın en düşük adresi kesinlikle 
- * SLOT_A_ADDR (0x08010000) olmak zorundadır. Yoksa reddedilir.
- * (0x08020000 gibi ara adresler engellendi).
- * 2. TAM OTOMATİK: Onay sorusu kaldırıldı, otomatik reset atar.
+ * GÜNCELLEME (v1.5):
+ * 1. FLASH KORUMASI: Hex dosyasının ilk veri satırının adresi 0x08010000
+ * değilse, Flash silinmeden işlem ANINDA iptal edilir.
+ * 2. TAM OTOMATİK: İşlem bitince soru sormadan reset atar.
  */
 
 #include "Bootloader_hex_xmodem.h"
@@ -43,8 +42,7 @@ static uint32_t hex_upper_addr = 0;
 static uint8_t  smart_buffer[16];
 static uint32_t smart_base_addr = 0xFFFFFFFF;
 static uint8_t  smart_dirty = 0;
-static uint32_t highest_written_addr = 0; /* Yedekleme boyutu için */
-static uint32_t lowest_written_addr = 0xFFFFFFFF; /* Başlangıç adresi kontrolü için */
+static uint32_t highest_written_addr = 0;
 
 typedef struct {
     uint32_t ActiveSlot;
@@ -204,10 +202,7 @@ static void Flush_Smart_Buffer(void) {
     }
 }
 static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
-    /* İstatistikleri Güncelle */
     if (addr > highest_written_addr) highest_written_addr = addr;
-    /* --- YENİ EKLENEN KONTROL --- */
-    if (addr < lowest_written_addr) lowest_written_addr = addr;
 
     uint32_t aligned_base = addr & 0xFFFFFFF0;
     uint8_t offset = addr & 0x0F;
@@ -239,14 +234,15 @@ void Xmodem_Receive_Hex_File(void)
     uint8_t line_idx = 0, in_line = 0;
     uint8_t is_flash_erased = 0;
     uint32_t total_bytes = 0;
+    
+    /* İLK VERİ SATIRI KONTROLÜ İÇİN BAYRAK */
+    uint8_t is_first_data_record = 1;
 
     /* Sıfırla */
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
     highest_written_addr = 0;
-    lowest_written_addr = 0xFFFFFFFF; // Resetliyoruz
 
-    /* --- HEDEF HER ZAMAN SLOT A --- */
     uint32_t target_slot = SLOT_A_ADDR;
 
     printf("\r\n========================================\r\n");
@@ -254,7 +250,7 @@ void Xmodem_Receive_Hex_File(void)
     printf(CLR_GREEN  " [AUTO] Target: Flash A (0x%08lX) \r\n", target_slot);
     printf("========================================\r\n");
 
-    printf(CLR_RED " [Warning] FLASH A will be updated and B overwritten. Confirm? (y/n) > \r\n");
+    printf(CLR_RED "Warning! Flash A will be updated. Confirm? (y/n) > \r\n");
     uint8_t confirm_char=0;
     while(1) {
         if(HAL_UART_Receive(&huart1, &confirm_char, 1, HAL_MAX_DELAY)== HAL_OK) {
@@ -318,16 +314,29 @@ void Xmodem_Receive_Hex_File(void)
                         else if (type == 0x00) {
                             uint32_t c_addr = (hex_upper_addr << 16) | alow;
 
-                            /* Sadece Slot A adresi kabul edilir */
+                            /* --- SIKI ADRES KONTROLÜ (Flash Silinmeden Önce) --- */
+                            if (is_first_data_record) {
+                                if (c_addr != SLOT_A_ADDR) {
+                                    /* HATA: İlk veri adresi Slot A başlangıcı DEĞİL! */
+                                    uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
+                                    printf("\r\n\r\n" CLR_RED "[ERROR] INVALID START ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
+                                    printf("Code MUST start exactly at 0x%08X (Slot A Base).\r\n", SLOT_A_ADDR);
+                                    printf("Upload Cancelled. Flash was NOT erased.\r\n");
+                                    return;
+                                }
+                                is_first_data_record = 0; /* İlk satır kontrolü geçti */
+                            }
+
+                            /* Diğer satırlar için sınır kontrolü */
                             if (c_addr < SLOT_A_ADDR || c_addr >= SLOT_B_ADDR) {
                                 uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
-                                printf("\r\n\r\n" CLR_RED "[ERROR] INVALID ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
-                                printf("Target must be in Slot A Range (0x%08X ...)\r\n", SLOT_A_ADDR);
+                                printf("\r\n\r\n" CLR_RED "[ERROR] ADDR OUT OF BOUNDS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
                                 return;
                             }
 
+                            /* Silme İşlemi (Güvenlik kontrolünden sonra) */
                             if (is_flash_erased == 0) {
-                                printf(CLR_YELLOW "\r\n[INFO] Valid Address Detected. Erasing Slot A... ");
+                                printf(CLR_YELLOW "\r\n[INFO] Valid Start Address. Erasing Slot A... ");
                                 if (Local_Flash_Erase_Target_Slot(target_slot) == 0) {
                                     uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
                                     return;
@@ -359,19 +368,8 @@ void Xmodem_Receive_Hex_File(void)
             HAL_UART_Transmit(&huart1, &ack, 1, 100);
             Flush_Smart_Buffer();
 
-            /* --- KRİTİK BAŞLANGIÇ ADRESİ KONTROLÜ --- */
-            /* Dosyanın en düşük adresi kesinlikle SLOT_A_ADDR olmalı */
-            if (lowest_written_addr != SLOT_A_ADDR) {
-                 printf("\r\n\r\n" CLR_RED "[ERROR] CRITICAL: Code does NOT start at Slot A Base (0x%08X)!" CLR_RESET "\r\n", SLOT_A_ADDR);
-                 printf(CLR_YELLOW "Detected Start Address: 0x%08lX\r\n" CLR_RESET, lowest_written_addr);
-                 printf("Please check your linker script (.isr_vector location).\r\n");
-                 /* Backup veya Reset yapmadan çıkıyoruz */
-                 return;
-            }
-
             /* --- YEDEKLEME --- */
             uint32_t fw_size = highest_written_addr - SLOT_A_ADDR + 1;
-            /* Güvenlik: 16'nın katına yuvarla */
             fw_size = (fw_size + 15) & 0xFFFFFFF0;
 
             Local_Backup_A_to_B(fw_size);
@@ -385,11 +383,9 @@ void Xmodem_Receive_Hex_File(void)
 			printf("Eski (A): v%lu.%lu.%lu\r\n", (old_ver>>16)&0xFF, (old_ver>>8)&0xFF, old_ver&0xFF);
 			printf("Yeni (A): v%lu.%lu.%lu\r\n", (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
 
-			/* OTOMATİK RESET */
+			/* OTOMATİK RESET (SORUSUZ) */
 			Write_Config_And_Reset(new_ver);
 		   xmodem_done = 1;
         }
     }
 }
-
-
