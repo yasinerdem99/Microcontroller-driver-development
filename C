@@ -2,14 +2,15 @@
  * @file    Bootloader_hex_xmodem.c
  * @author  yerdem
  * @brief   XMODEM Protokolü ile Intel Hex (.hex) Yükleme Modülü (Active/Backup).
- * @version 1.2
+ * @version 1.4
  * @date    2025-12-12
  *
  * @details
- * Active/Backup mimarisi.
- * GÜNCELLEME: SIKI ADRES KONTROLÜ (STRICT ADDRESS CHECK)
- * Slot A sınırları dışındaki herhangi bir adres (Bootloader veya Slot B)
- * tespit edildiği anda yükleme iptal edilir.
+ * GÜNCELLEME (v1.4):
+ * 1. "LOWEST ADDRESS" KONTROLÜ: Dosyanın en düşük adresi kesinlikle 
+ * SLOT_A_ADDR (0x08010000) olmak zorundadır. Yoksa reddedilir.
+ * (0x08020000 gibi ara adresler engellendi).
+ * 2. TAM OTOMATİK: Onay sorusu kaldırıldı, otomatik reset atar.
  */
 
 #include "Bootloader_hex_xmodem.h"
@@ -43,6 +44,7 @@ static uint8_t  smart_buffer[16];
 static uint32_t smart_base_addr = 0xFFFFFFFF;
 static uint8_t  smart_dirty = 0;
 static uint32_t highest_written_addr = 0; /* Yedekleme boyutu için */
+static uint32_t lowest_written_addr = 0xFFFFFFFF; /* Başlangıç adresi kontrolü için */
 
 typedef struct {
     uint32_t ActiveSlot;
@@ -100,8 +102,8 @@ static void Write_Config_And_Reset(uint32_t new_ver) {
 
     HAL_FLASH_Lock();
 
-    printf(CLR_GREEN "\r\n[SUCCESS] Config Updated! System Resetting...\r\n" CLR_RESET);
-    HAL_Delay(1000);
+    printf(CLR_GREEN "\r\n[SUCCESS] Config Updated! Rebooting in 2 seconds...\r\n" CLR_RESET);
+    HAL_Delay(2000);
     HAL_NVIC_SystemReset();
 }
 
@@ -202,8 +204,10 @@ static void Flush_Smart_Buffer(void) {
     }
 }
 static void Smart_Hex_Write_Byte(uint32_t addr, uint8_t byte) {
-    /* İstatistik için en yüksek adresi tut */
+    /* İstatistikleri Güncelle */
     if (addr > highest_written_addr) highest_written_addr = addr;
+    /* --- YENİ EKLENEN KONTROL --- */
+    if (addr < lowest_written_addr) lowest_written_addr = addr;
 
     uint32_t aligned_base = addr & 0xFFFFFFF0;
     uint8_t offset = addr & 0x0F;
@@ -240,6 +244,7 @@ void Xmodem_Receive_Hex_File(void)
     hex_upper_addr = 0;
     smart_base_addr = 0xFFFFFFFF; smart_dirty = 0; memset(smart_buffer, 0xFF, 16);
     highest_written_addr = 0;
+    lowest_written_addr = 0xFFFFFFFF; // Resetliyoruz
 
     /* --- HEDEF HER ZAMAN SLOT A --- */
     uint32_t target_slot = SLOT_A_ADDR;
@@ -249,7 +254,7 @@ void Xmodem_Receive_Hex_File(void)
     printf(CLR_GREEN  " [AUTO] Target: Flash A (0x%08lX) \r\n", target_slot);
     printf("========================================\r\n");
 
-    printf(CLR_RED "Warning! Flash A will be updated. Confirm? (y/n) > \r\n");
+    printf(CLR_RED " [Warning] FLASH A will be updated and B overwritten. Confirm? (y/n) > \r\n");
     uint8_t confirm_char=0;
     while(1) {
         if(HAL_UART_Receive(&huart1, &confirm_char, 1, HAL_MAX_DELAY)== HAL_OK) {
@@ -313,26 +318,16 @@ void Xmodem_Receive_Hex_File(void)
                         else if (type == 0x00) {
                             uint32_t c_addr = (hex_upper_addr << 16) | alow;
 
-                            /* --- KRİTİK GÜVENLİK DÜZELTMESİ --- */
-                            /* 1. Bootloader Koruması */
-                            if (c_addr < SLOT_A_ADDR) {
+                            /* Sadece Slot A adresi kabul edilir */
+                            if (c_addr < SLOT_A_ADDR || c_addr >= SLOT_B_ADDR) {
                                 uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
                                 printf("\r\n\r\n" CLR_RED "[ERROR] INVALID ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
-                                printf(CLR_RED "You cannot write to Bootloader Area (0x0800...).\r\n" CLR_RESET);
+                                printf("Target must be in Slot A Range (0x%08X ...)\r\n", SLOT_A_ADDR);
                                 return;
                             }
 
-                            /* 2. Slot B Koruması (Yedek Alanı) */
-                            if (c_addr >= SLOT_B_ADDR) {
-                                uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
-                                printf("\r\n\r\n" CLR_RED "[ERROR] INVALID ADDRESS (0x%08lX)!" CLR_RESET "\r\n", c_addr);
-                                printf(CLR_RED "Target is ALWAYS Slot A. Do not use Slot B addresses.\r\n" CLR_RESET);
-                                return;
-                            }
-
-                            /* Silme İşlemi (Sadece geçerli veri geldiğinde ilk kez) */
                             if (is_flash_erased == 0) {
-                                printf(CLR_YELLOW "\r\n[INFO] Address Valid (Slot A). Erasing... ");
+                                printf(CLR_YELLOW "\r\n[INFO] Valid Address Detected. Erasing Slot A... ");
                                 if (Local_Flash_Erase_Target_Slot(target_slot) == 0) {
                                     uint8_t can = CAN; for(int k=0; k<5; k++) HAL_UART_Transmit(&huart1, &can, 1, 100);
                                     return;
@@ -364,6 +359,16 @@ void Xmodem_Receive_Hex_File(void)
             HAL_UART_Transmit(&huart1, &ack, 1, 100);
             Flush_Smart_Buffer();
 
+            /* --- KRİTİK BAŞLANGIÇ ADRESİ KONTROLÜ --- */
+            /* Dosyanın en düşük adresi kesinlikle SLOT_A_ADDR olmalı */
+            if (lowest_written_addr != SLOT_A_ADDR) {
+                 printf("\r\n\r\n" CLR_RED "[ERROR] CRITICAL: Code does NOT start at Slot A Base (0x%08X)!" CLR_RESET "\r\n", SLOT_A_ADDR);
+                 printf(CLR_YELLOW "Detected Start Address: 0x%08lX\r\n" CLR_RESET, lowest_written_addr);
+                 printf("Please check your linker script (.isr_vector location).\r\n");
+                 /* Backup veya Reset yapmadan çıkıyoruz */
+                 return;
+            }
+
             /* --- YEDEKLEME --- */
             uint32_t fw_size = highest_written_addr - SLOT_A_ADDR + 1;
             /* Güvenlik: 16'nın katına yuvarla */
@@ -380,22 +385,11 @@ void Xmodem_Receive_Hex_File(void)
 			printf("Eski (A): v%lu.%lu.%lu\r\n", (old_ver>>16)&0xFF, (old_ver>>8)&0xFF, old_ver&0xFF);
 			printf("Yeni (A): v%lu.%lu.%lu\r\n", (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
 
-			printf("\r\nAktif edilsin mi? (e: Evet, h: Hayir) > \r\n");
-
-			while(1) {
-				uint8_t rx;
-				if(HAL_UART_Receive(&huart1, &rx, 1, HAL_MAX_DELAY) == HAL_OK) {
-					if(rx=='e'||rx=='E') {
-						Write_Config_And_Reset(new_ver);
-						break;
-					}
-					if(rx=='h'||rx=='H') {
-						printf(CLR_RED "\r\n[IPTAL] Reset atilmadi.\r\n" CLR_RESET);
-						break;
-					}
-				}
-			}
+			/* OTOMATİK RESET */
+			Write_Config_And_Reset(new_ver);
 		   xmodem_done = 1;
         }
     }
 }
+
+
