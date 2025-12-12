@@ -1,53 +1,62 @@
 /*
- * @file Bootloader_bin_raw.c
+ * @file Bootloader_hex_raw.c
  * @author yerdem
- * @brief Raw Binary (.bin) Yükleme Modülü (ALL-IN-ONE)
+ * @brief Raw Hex (.hex) Yükleme Modülü (ALL-IN-ONE & ACTIVE/BACKUP)
  * @version 1.5
  * @date 12/12/2025
  *
  * @details 
- * Bu modül tüm yükleme, doğrulama, yedekleme (backup) ve geri alma (rollback)
- * işlemlerini tek çatı altında toplar. Harici versiyon modülüne ihtiyaç duymaz.
- *
+ * Bu modül DMA+Polling ile Hex verisi alır.
  * MANTIK:
- * 1. Dosya Slot A'ya yüklenir.
- * 2. Kullanıcı onaylarsa B'ye yedeklenir.
- * 3. Onaylamazsa B'den geri yüklenir.
+ * 1. Veriyi Slot A'ya yazar (Slot B'ye dokunmaz).
+ * 2. İşlem bitince versiyonları kıyaslar ve sorar.
+ * 3. EVET -> A'yı B'ye kopyalar (Yedekleme).
+ * 4. HAYIR -> B'yi A'ya kopyalar (Rollback).
  */
 
-#include "Bootloader_bin_raw.h"
+#include "Bootloader_hex_raw.h"
 #include "Bootloader_config.h"
 #include <stdio.h>
 #include <string.h>
 
+/* --- DONANIM TANIMLARI --- */
 extern UART_HandleTypeDef huart1;
+extern DMA_HandleTypeDef handle_GPDMA1_Channel0;
 
 /* --- AYARLAR --- */
 #define FLASH_BANK2_START_ADDR  0x08200000
 #define APP_NUM_PAGES_TO_ERASE  128
-#define MAX_ALLOWED_OFFSET      0x4000
 #define VERSION_OFFSET          0x400
-#define BIN_BUFFER_SIZE         (256 * 1024)
 
-/* RAM Buffer */
-static uint8_t g_bin_buffer[BIN_BUFFER_SIZE] __attribute__((aligned(4)));
-static uint32_t g_bin_len = 0;
+/* RAM Buffer (256KB) */
+#define RAW_BUFFER_SIZE  (256 * 1024)
+static uint8_t g_raw_buffer[RAW_BUFFER_SIZE] __attribute__((aligned(4)));
+
+/* DMA Ring Buffer */
+#define DMA_RX_BUFFER_SIZE 4096
+static uint8_t dma_rx_buffer[DMA_RX_BUFFER_SIZE] __attribute__((aligned(4)));
+static uint32_t dma_tail_ptr = 0;
+
+/* Parser Değişkenleri */
+static uint32_t hex_upper_addr_raw = 0;
+static char line_buffer[600];
+static uint32_t g_max_offset = 0;
 
 /* Renkler */
 #define CLR_RESET   "\033[0m"
 #define CLR_GREEN   "\033[1;92m"
 #define CLR_RED     "\033[1;91m"
-#define CLR_YELLOW  "\033[33m"
+#define CLR_YELLOW  "\033[1;93m"
 #define CLR_CYAN    "\033[36m"
 #define CLR_BOLD    "\033[1m"
 
-uint8_t rx_char_bin = 0;
+uint8_t rx_char_raw = 0;
 
 /* ============================================================ */
 /* YARDIMCI FLASH FONKSİYONLARI (PRIVATE)                       */
 /* ============================================================ */
 
-/* 1. Flash Yazma (16-Byte Aligned) */
+/* 1. Flash Yazma */
 static uint8_t Local_Flash_Write(uint32_t address, uint8_t *data, uint16_t len)
 {
     uint32_t temp_data[4];
@@ -61,7 +70,6 @@ static uint8_t Local_Flash_Write(uint32_t address, uint8_t *data, uint16_t len)
         __disable_irq();
         HAL_StatusTypeDef status = HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address + i, (uint32_t)temp_data);
         __enable_irq();
-        
         if (status != HAL_OK) { HAL_FLASH_Lock(); return 0; }
     }
     HAL_FLASH_Lock(); return 1;
@@ -72,13 +80,10 @@ static uint8_t Local_Flash_Erase_Slot_A(void)
 {
     FLASH_EraseInitTypeDef EraseInitStruct;
     uint32_t PageError;
-    
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
-    /* Slot A = Bank 1 */
     uint32_t start_page = (SLOT_A_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
-    
     EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
     EraseInitStruct.Banks       = FLASH_BANK_1;
     EraseInitStruct.Page        = start_page;
@@ -93,21 +98,19 @@ static uint8_t Local_Flash_Erase_Slot_B(void)
 {
     FLASH_EraseInitTypeDef EraseInitStruct;
     uint32_t PageError;
-    
     HAL_FLASH_Unlock();
     __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
 
-    /* Slot B = Bank 2 */
     EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
     EraseInitStruct.Banks       = FLASH_BANK_2;
-    EraseInitStruct.Page        = 0; // Bank 2'nin 0. sayfası
+    EraseInitStruct.Page        = 0;
     EraseInitStruct.NbPages     = APP_NUM_PAGES_TO_ERASE;
 
     if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) { HAL_FLASH_Lock(); return 0; }
     HAL_FLASH_Lock(); return 1;
 }
 
-/* 4. Backup (A -> B) - Kullanıcı "EVET" derse */
+/* 4. Backup (A -> B) */
 static void Local_Backup_A_to_B(uint32_t fw_size)
 {
     printf(CLR_CYAN "\r\n[BACKUP] Creating Backup (A -> B)... " CLR_RESET);
@@ -118,8 +121,10 @@ static void Local_Backup_A_to_B(uint32_t fw_size)
     uint8_t buffer[256];
     uint32_t copied = 0;
 
-    /* Güvenlik: Minimum 128KB kopyala */
-    if(fw_size < (128*1024)) fw_size = (128*1024);
+    /* Hex dosyaları parçalı olabilir, tüm alanı (en az 1MB) kopyalamak daha güvenli */
+    /* Ancak hız için yazılan en son adrese kadar kopyalayabiliriz */
+    /* Güvenlik için en az 256KB */
+    if(fw_size < (256*1024)) fw_size = (256*1024);
 
     while(copied < fw_size) {
         memcpy(buffer, (uint32_t*)read_addr, 256);
@@ -132,20 +137,17 @@ static void Local_Backup_A_to_B(uint32_t fw_size)
     printf(CLR_GREEN " Done!\r\n" CLR_RESET);
 }
 
-/* 5. Rollback (B -> A) - Kullanıcı "HAYIR" derse */
+/* 5. Rollback (B -> A) */
 static void Local_Rollback_B_to_A(void)
 {
     printf(CLR_RED "\r\n[ROLLBACK] Rejecting Update... Restoring OLD version from Backup (B)...\r\n" CLR_RESET);
-    
-    /* Önce yanlış yüklenen A'yı sil */
     if(!Local_Flash_Erase_Slot_A()) { printf("Erase Failed!\r\n"); return; }
 
     uint32_t read_addr = SLOT_B_ADDR;
     uint32_t write_addr = SLOT_A_ADDR;
     uint8_t buffer[256];
     
-    /* B'deki yedeği (1MB varsayılan) geri yüklüyoruz */
-    /* Not: Gerçek uygulamada yedek boyutu biliniyorsa o kadar kopyalanır */
+    /* B'deki yedeği geri yükle (1MB varsayılan) */
     for (int i = 0; i < (1024 * 1024); i += 256) {
         memcpy(buffer, (uint32_t*)read_addr, 256);
         if (!Local_Flash_Write(write_addr, buffer, 256)) {
@@ -157,7 +159,7 @@ static void Local_Rollback_B_to_A(void)
     printf(CLR_GREEN "\r\n[ROLLBACK] System restored.\r\n" CLR_RESET);
 }
 
-/* 6. Config Güncelleme ve Reset */
+/* 6. Config Güncelleme */
 static void Update_Config_And_Reset(uint32_t new_ver)
 {
     FLASH_EraseInitTypeDef EraseInitStruct;
@@ -180,10 +182,8 @@ static void Update_Config_And_Reset(uint32_t new_ver)
     EraseInitStruct.NbPages     = 1;
     HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
 
-    /* ActiveSlot hep A, Versionlar eşitlenir */
     uint32_t data[4] = {SLOT_A_ACTIVE, new_ver, new_ver, 0};
     HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)data);
-
     HAL_FLASH_Lock();
 
     printf(CLR_GREEN "\r\n[SUCCESS] Version v%lu.%lu.%lu Active! Rebooting...\r\n" CLR_RESET,
@@ -192,86 +192,173 @@ static void Update_Config_And_Reset(uint32_t new_ver)
     HAL_NVIC_SystemReset();
 }
 
+/* YARDIMCI PARSER */
+static uint8_t Raw_HexCharToByte(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    return 0;
+}
+static uint8_t Raw_ParseByte(char* ptr) {
+    return (Raw_HexCharToByte(ptr[0]) << 4) | Raw_HexCharToByte(ptr[1]);
+}
+static void Raw_Drain_UART(void) {
+    uint8_t dummy; uint32_t tick = HAL_GetTick();
+    while ((HAL_GetTick() - tick) < 500) {
+        if (HAL_UART_Receive(&huart1, &dummy, 1, 10) == HAL_OK) tick = HAL_GetTick();
+        else break;
+    }
+}
+
 /* ============================================================ */
-/* ANA FONKSIYON                                */
+/* ANA FONKSIYON: RECEIVE RAW HEX                               */
 /* ============================================================ */
 
-void Receive_Raw_Bin_File(void)
+void Receive_Raw_Hex_File(void)
 {
-    g_bin_len = 0;
+    uint16_t line_idx = 0;
+    uint8_t in_line = 0;
+    const char* error_msg = NULL;
+
+    /* Temizlik */
+    g_max_offset = 0;
+    hex_upper_addr_raw = 0;
+    dma_tail_ptr = 0;
+    memset(g_raw_buffer, 0xFF, RAW_BUFFER_SIZE);
+
+    /* HEDEF HER ZAMAN SLOT A */
+    uint32_t target_slot_addr = SLOT_A_ADDR;
 
     printf("\r\n========================================\r\n");
-    printf(CLR_YELLOW " [INFO] System Mode: ACTIVE / BACKUP\r\n");
+    printf(CLR_YELLOW " [INFO] Mode: ACTIVE / BACKUP\r\n");
     printf(CLR_GREEN  " [AUTO] Target: Flash A (Pending Update)\r\n");
     printf("========================================\r\n");
     printf(CLR_RED " [Warning] FLASH A will be updated. Confirm? (y/n) > \r\n");
-    
-    while(1) {
-        HAL_UART_Receive(&huart1, &rx_char_bin, 1, HAL_MAX_DELAY);
-        if (rx_char_bin == 'y' || rx_char_bin == 'Y') break;
-        if (rx_char_bin == 'n' || rx_char_bin == 'N') { printf("Cancel.\r\n"); return; }
-    }
 
+    while(1) {
+        HAL_UART_Receive(&huart1, &rx_char_raw, 1, HAL_MAX_DELAY);
+        if (rx_char_raw == 'y' || rx_char_raw == 'Y') break;
+        if (rx_char_raw == 'n' || rx_char_raw == 'N') { printf("Cancel.\r\n"); return; }
+    }
     printf("\r\n [READY] Waiting for file... (Press 'e' to cancel)\r\n");
 
-    /* VERİ YAKALAMA (RAM'e) */
-    uint32_t last_rx = HAL_GetTick();
+    if(HAL_UART_Receive_DMA(&huart1, dma_rx_buffer, DMA_RX_BUFFER_SIZE) != HAL_OK) return;
+
+    uint32_t last_rx_tick = HAL_GetTick();
     uint8_t data_started = 0;
 
-    while(1) {
-        if (__HAL_UART_GET_FLAG(&huart1, UART_FLAG_RXNE)) {
-            uint8_t c = (uint8_t)(huart1.Instance->RDR & 0xFF);
+    /* --- PARSING LOOP --- */
+    while (1)
+    {
+        uint32_t dma_remaining = __HAL_DMA_GET_COUNTER(huart1.hdmarx);
+        uint32_t dma_head_ptr = (DMA_RX_BUFFER_SIZE - dma_remaining) % DMA_RX_BUFFER_SIZE;
+
+        while (dma_tail_ptr != dma_head_ptr)
+        {
+            uint8_t c = dma_rx_buffer[dma_tail_ptr];
+            dma_tail_ptr++; if (dma_tail_ptr >= DMA_RX_BUFFER_SIZE) dma_tail_ptr = 0;
+            last_rx_tick = HAL_GetTick();
+
             if (!data_started) {
-                if (c == 'e' || c == 'E') { printf("\r\n" CLR_RED "[CANCEL]\r\n"); return; }
-                data_started = 1;
+                if (c == 'e' || c == 'E') { error_msg = "User Cancelled"; goto EXIT_WITH_ERROR; }
+                if (c == ':') data_started = 1; else continue;
             }
-            if (g_bin_len < BIN_BUFFER_SIZE) g_bin_buffer[g_bin_len++] = c;
-            last_rx = HAL_GetTick();
-        } else {
-            if (data_started && (HAL_GetTick() - last_rx > 1500)) break;
+
+            if (c == ':') { in_line = 1; line_idx = 0; continue; }
+            if (!in_line) continue;
+
+            if (c == '\r' || c == '\n')
+            {
+                in_line = 0;
+                line_buffer[line_idx] = '\0';
+                if(line_idx < 10) continue;
+
+                uint8_t count = Raw_ParseByte(&line_buffer[0]);
+                uint16_t alow = (Raw_ParseByte(&line_buffer[2]) << 8) | Raw_ParseByte(&line_buffer[4]);
+                uint8_t type  = Raw_ParseByte(&line_buffer[6]);
+
+                if (type == 0x04) {
+                    hex_upper_addr_raw = (Raw_ParseByte(&line_buffer[8]) << 8) | Raw_ParseByte(&line_buffer[10]);
+                }
+                else if (type == 0x00) {
+                    uint32_t abs_addr = (hex_upper_addr_raw << 16) | alow;
+
+                    /* KORUMA: Bootloader */
+                    if (abs_addr >= 0x08000000 && abs_addr < 0x08010000) continue;
+
+                    /* KORUMA: SLOT B ADRESINE YAZMA GİRİŞİMİ */
+                    if (abs_addr >= SLOT_B_ADDR) {
+                        error_msg = "Invalid Address! Target must be Slot A range.";
+                        goto EXIT_WITH_ERROR;
+                    }
+
+                    if (abs_addr < target_slot_addr) continue; 
+                    uint32_t offset = abs_addr - target_slot_addr;
+
+                    if (offset + count > RAW_BUFFER_SIZE) {
+                        error_msg = "RAM Buffer Overflow"; goto EXIT_WITH_ERROR;
+                    }
+
+                    for(int i=0; i<count; i++) {
+                        g_raw_buffer[offset + i] = Raw_ParseByte(&line_buffer[8+(i*2)]);
+                    }
+                    if (offset + count > g_max_offset) g_max_offset = offset + count;
+                }
+                else if (type == 0x01) {
+                    goto START_FLASHING;
+                }
+                line_idx = 0;
+            }
+            else {
+                if (line_idx < 599) line_buffer[line_idx++] = c;
+            }
+        }
+        if (data_started && (HAL_GetTick() - last_rx_tick > 2000)) {
+            error_msg = "Timeout"; goto EXIT_WITH_ERROR;
         }
     }
 
-    if (g_bin_len == 0) return;
-    printf(CLR_YELLOW "\r\n[INFO] Received: %lu Bytes. Analyzing...\r\n", g_bin_len);
+EXIT_WITH_ERROR:
+    HAL_UART_DMAStop(&huart1);
+    Raw_Drain_UART();
+    printf("\r\n\n" CLR_RED "[ERROR] %s" CLR_RESET "\r\n", error_msg ? error_msg : "Unknown Error");
+    HAL_Delay(1000);
+    return;
 
-    /* GÜVENLİK KONTROLÜ */
-    if (g_bin_len > 8) {
-        uint32_t reset_vector = *((uint32_t*)&g_bin_buffer[4]);
-        if (reset_vector < SLOT_A_ADDR || reset_vector > (SLOT_A_ADDR + MAX_ALLOWED_OFFSET)) {
-            printf(CLR_RED "\r\n[ERROR] Address mismatch! Target is ALWAYS Slot A.\r\n" CLR_RESET);
-            return;
-        }
-    } else {
-        printf(CLR_RED "\r\n[WARNING] File too short!\r\n" CLR_RESET); return;
+START_FLASHING:
+    HAL_UART_DMAStop(&huart1);
+
+    /* HEADER KONTROLÜ (Buffer başı) */
+    uint32_t reset_vector = (g_raw_buffer[7] << 24) | (g_raw_buffer[6] << 16) | (g_raw_buffer[5] << 8) | g_raw_buffer[4];
+    
+    if (reset_vector == 0xFFFFFFFF || reset_vector < SLOT_A_ADDR || reset_vector > (SLOT_A_ADDR + 0x100000)) {
+        printf("\r\n" CLR_RED "[ERROR] ADDRESS MISMATCH! File must be compiled for Slot A." CLR_RESET "\r\n");
+        return;
     }
 
-    /* SADECE SLOT A'YA YAZ (B'ye Dokunma) */
-    printf("[INFO] Erasing SLOT A...\r\n");
+    /* FLASH A SİLME VE YAZMA */
+    printf("\r\n[INFO] Valid. Erasing Slot A...\r\n");
     if (Local_Flash_Erase_Slot_A() == 0) return;
 
-    printf("[INFO] Writing to SLOT A...\r\n");
-    uint32_t write_addr = SLOT_A_ADDR;
+    printf("[INFO] Writing to Slot A...\r\n");
+    uint32_t write_addr = target_slot_addr;
     uint32_t bytes_written = 0;
 
-    while (bytes_written < g_bin_len) {
-        uint32_t chunk = 128;
-        if (g_bin_len - bytes_written < 128) chunk = g_bin_len - bytes_written;
-        if (Local_Flash_Write(write_addr, &g_bin_buffer[bytes_written], chunk) == 0) return;
-        write_addr += chunk; bytes_written += chunk;
-        if (bytes_written % 4096 == 0) { printf("."); fflush(stdout); }
+    while (bytes_written < g_max_offset) {
+        uint32_t chunk_len = 256;
+        if (g_max_offset - bytes_written < chunk_len) chunk_len = g_max_offset - bytes_written;
+        if (Local_Flash_Write(write_addr, &g_raw_buffer[bytes_written], chunk_len) == 0) return;
+        write_addr += chunk_len; bytes_written += chunk_len;
+        if (bytes_written % 8192 == 0) { printf("."); fflush(stdout); }
     }
 
     /* =============================================== */
-    /* VERSİYON KONTROL VE KARAR AŞAMASI (Embedded)    */
+    /* VERSİYON KONTROL VE KARAR AŞAMASI               */
     /* =============================================== */
 
-    /* 1. Eski Versiyonu Oku (Config) */
     uint32_t *pConfig = (uint32_t*)CONFIG_PAGE_ADDR;
-    uint32_t old_ver = pConfig[1]; 
-    if(old_ver == 0xFFFFFFFF) old_ver = 0;
-
-    /* 2. Yeni Versiyonu Oku (Slot A'dan) */
+    uint32_t old_ver = pConfig[1]; if(old_ver == 0xFFFFFFFF) old_ver = 0;
+    
     uint32_t *pNewApp = (uint32_t*)(SLOT_A_ADDR + VERSION_OFFSET);
     uint32_t new_ver = *pNewApp;
 
@@ -301,8 +388,7 @@ void Receive_Raw_Bin_File(void)
             /* --- EVET: YEDEKLE ve GÜNCELLE --- */
             if(rx == 'e' || rx == 'E') {
                 /* 1. Yedeği Oluştur (A -> B) */
-                Local_Backup_A_to_B(g_bin_len);
-                
+                Local_Backup_A_to_B(g_max_offset);
                 /* 2. Config Güncelle ve Reset */
                 Update_Config_And_Reset(new_ver);
                 break;
@@ -311,7 +397,6 @@ void Receive_Raw_Bin_File(void)
             /* --- HAYIR: ESKİYE DÖN (ROLLBACK) --- */
             if(rx == 'h' || rx == 'H') {
                 printf(CLR_RED "\r\n[CANCEL] Update rejected.\r\n" CLR_RESET);
-                
                 /* 1. B'deki (eski) yedeği A'ya geri yükle */
                 Local_Rollback_B_to_A();
                 
@@ -324,5 +409,3 @@ void Receive_Raw_Bin_File(void)
         }
     }
 }
-
-
