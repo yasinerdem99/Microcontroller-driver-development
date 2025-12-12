@@ -1,28 +1,205 @@
-  .isr_vector :
-  {
-  	. = ALIGN(4);
-    KEEP(*(.isr_vector)) /* Startup code */
-    . = ALIGN(4);
-  } >FLASH
-  
-   .app_version :
-  {
-  	. = ALIGN(4);	
-  	. = ORIGIN(FLASH) + 0x400;
-	KEEP(*(.app_version))
-	. = ALIGN(4);
-  } >FLASH
+/**
+ * @file    Bootloader_version.c
+ * @author  yerdem
+ * @brief   Versiyon Kontrol ve Onay Modülü
+ * @version 1.0
+ * @date    2025-12-12
+ *
+ * @details
+ * Bu modül, yükleme işlemi bittikten sonra çağrılır.
+ * 1. Yüklenen uygulamanın versiyonunu okur.
+ * 2. Mevcut versiyonla kıyaslar (Upgrade/Downgrade analizi).
+ * 3. Kullanıcıdan onay ister.
+ * 4. Onay verilmezse Slot B'den Slot A'ya geri yükleme (Rollback) yapar.
+ */
 
-#include <stdint.h>
+#include "Bootloader_version.h"
+#include "Bootloader_config.h"
+#include <stdio.h>
+#include <string.h>
 
-/* Derleyici bu veriyi ".app_version" bolumune koyar */
-#if defined ( __GNUC__ )
-  #define __SECTION(x) __attribute__((section(x)))
-#else
-  #define __SECTION(x)
-#endif
+extern UART_HandleTypeDef huart1;
 
+/* Renk Kodları */
+#define CLR_RESET   "\033[0m"
+#define CLR_RED     "\033[1;91m"
+#define CLR_GREEN   "\033[1;92m"
+#define CLR_YELLOW  "\033[1;93m"
+#define CLR_CYAN    "\033[36m"
+#define CLR_BOLD    "\033[1m"
 
-/* Örn: 0x00010005 -> v1.0.5 */
-/* __attribute__((used)) ile derleyicinin bunu optimize edip silmesini engeller */
-const uint32_t __SECTION(".app_version") __attribute__((used)) App_Version = 0x00010002;
+/* Versiyonun bulunduğu offset (Linker Script'te .app_version) */
+#define VERSION_OFFSET  0x400
+
+/* Sabit Rollback Boyutu (Örn: 512KB).
+ * Not: Daha akıllı olması için Config'e dosya boyutu da kaydedilebilir.
+ */
+#define ROLLBACK_SIZE   (512 * 1024)
+
+/* --- YARDIMCI FLASH FONKSİYONLARI (Bu dosya içinde private) --- */
+
+static uint8_t Ver_Flash_Write(uint32_t address, uint8_t *data, uint16_t len) {
+    uint32_t temp_data[4];
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    for (int i = 0; i < len; i += 16) {
+        memset(temp_data, 0xFF, 16);
+        uint16_t copy_len = (len - i) >= 16 ? 16 : (len - i);
+        memcpy(temp_data, &data[i], copy_len);
+        if (HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, address + i, (uint32_t)temp_data) != HAL_OK) {
+            HAL_FLASH_Lock(); return 0;
+        }
+    }
+    HAL_FLASH_Lock(); return 1;
+}
+
+static uint8_t Ver_Flash_Erase_Slot_A(void) {
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+    /* Slot A = Bank 1, Page 0'dan itibaren (Bootloader hariç) */
+    /* Not: Bootloader 0x08000000 - 0x08010000 arası ise Slot A 0x08010000'dan başlar */
+    /* Slot A Page Index: (0x08010000 - 0x08000000) / 8192 = 8. Sayfa */
+    
+    uint32_t start_page = (SLOT_A_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
+    
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = FLASH_BANK_1;
+    EraseInitStruct.Page        = start_page;
+    EraseInitStruct.NbPages     = 120; // 128 - 8 = 120 sayfa (Yaklaşık 1MB'a kadar)
+
+    if (HAL_FLASHEx_Erase(&EraseInitStruct, &PageError) != HAL_OK) {
+        HAL_FLASH_Lock(); return 0;
+    }
+    HAL_FLASH_Lock(); return 1;
+}
+
+static void Perform_Rollback_B_to_A(void) {
+    printf(CLR_RED "\r\n[ROLLBACK] Reverting changes... Copying OLD version from Backup (B) -> Main (A)...\r\n" CLR_RESET);
+    
+    /* 1. Slot A'yı Sil */
+    printf("[ROLLBACK] Erasing Slot A... ");
+    if(!Ver_Flash_Erase_Slot_A()) { printf("FAIL!\r\n"); return; }
+    printf("OK.\r\n");
+
+    /* 2. B'den A'ya Kopyala */
+    printf("[ROLLBACK] Restoring... ");
+    uint32_t read_addr = SLOT_B_ADDR;
+    uint32_t write_addr = SLOT_A_ADDR;
+    uint8_t buffer[256];
+
+    for (int i = 0; i < ROLLBACK_SIZE; i += 256) {
+        memcpy(buffer, (uint32_t*)read_addr, 256);
+        if (!Ver_Flash_Write(write_addr, buffer, 256)) {
+            printf("WRITE ERROR!\r\n"); return;
+        }
+        read_addr += 256; write_addr += 256;
+        if (i % 65536 == 0) { printf("."); fflush(stdout); }
+    }
+    printf(CLR_GREEN "\r\n[ROLLBACK] System restored to previous version.\r\n" CLR_RESET);
+}
+
+static void Update_Config_And_Reset(uint32_t new_ver) {
+    FLASH_EraseInitTypeDef EraseInitStruct;
+    uint32_t PageError;
+    uint32_t BankNumber;
+    uint32_t StartPage;
+
+    if (CONFIG_PAGE_ADDR < 0x08200000) {
+        BankNumber = FLASH_BANK_1;
+        StartPage = (CONFIG_PAGE_ADDR - FLASH_BASE) / FLASH_PAGE_SIZE;
+    } else {
+        BankNumber = FLASH_BANK_2;
+        StartPage = (CONFIG_PAGE_ADDR - 0x08200000) / FLASH_PAGE_SIZE;
+    }
+
+    HAL_FLASH_Unlock();
+    __HAL_FLASH_CLEAR_FLAG(FLASH_FLAG_ALL_ERRORS);
+
+    EraseInitStruct.TypeErase   = FLASH_TYPEERASE_PAGES;
+    EraseInitStruct.Banks       = BankNumber;
+    EraseInitStruct.Page        = StartPage;
+    EraseInitStruct.NbPages     = 1;
+    HAL_FLASHEx_Erase(&EraseInitStruct, &PageError);
+
+    /* ActiveSlot hep A, Versionlar eşitlenir */
+    uint32_t data[4] = {SLOT_A_ACTIVE, new_ver, new_ver, 0};
+    HAL_FLASH_Program(FLASH_TYPEPROGRAM_QUADWORD, CONFIG_PAGE_ADDR, (uint32_t)data);
+
+    HAL_FLASH_Lock();
+
+    printf(CLR_GREEN "\r\n[SUCCESS] Version v%lu.%lu.%lu Activated! Rebooting...\r\n" CLR_RESET,
+            (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
+    HAL_Delay(1000);
+    HAL_NVIC_SystemReset();
+}
+
+/* --- PUBLIC FONKSİYON --- */
+
+void Bootloader_Version_Control_Process(void)
+{
+    /* 1. Config'den Eski Versiyonu Oku */
+    uint32_t *pConfig = (uint32_t*)CONFIG_PAGE_ADDR;
+    uint32_t old_ver = pConfig[1]; // VersionSlotA
+    if(old_ver == 0xFFFFFFFF) old_ver = 0;
+
+    /* 2. Slot A'dan (Yeni Yüklenen) Yeni Versiyonu Oku */
+    uint32_t *pNewApp = (uint32_t*)(SLOT_A_ADDR + VERSION_OFFSET);
+    uint32_t new_ver = *pNewApp;
+
+    printf("\r\n\r\n========================================\r\n");
+    printf(      "          VERSION CONTROL               \r\n");
+    printf(      "========================================\r\n");
+
+    if(new_ver == 0xFFFFFFFF) {
+        printf(CLR_RED "[WARNING] No version tag found at 0x%08X!\r\n" CLR_RESET, SLOT_A_ADDR + VERSION_OFFSET);
+        printf("Assuming v0.0.0\r\n");
+        new_ver = 0;
+    }
+
+    printf("Current (Active): v%lu.%lu.%lu\r\n", (old_ver>>16)&0xFF, (old_ver>>8)&0xFF, old_ver&0xFF);
+    printf("Uploaded (New)  : v%lu.%lu.%lu\r\n", (new_ver>>16)&0xFF, (new_ver>>8)&0xFF, new_ver&0xFF);
+    printf("----------------------------------------\r\n");
+
+    /* 3. Karşılaştırma ve Renkli Çıktı */
+    if (new_ver > old_ver) {
+        printf(CLR_GREEN CLR_BOLD "STATUS: UPGRADE (Yukseltme) -> Recommended.\r\n" CLR_RESET);
+    } else if (new_ver < old_ver) {
+        printf(CLR_RED CLR_BOLD   "STATUS: DOWNGRADE (Surum Dusurme) -> Warning!\r\n" CLR_RESET);
+    } else {
+        printf(CLR_YELLOW CLR_BOLD "STATUS: RE-INSTALL (Ayni Surum) -> No Change.\r\n" CLR_RESET);
+    }
+
+    /* 4. Onay Sorusu */
+    printf("\r\nActivate this version? (e: Yes, h: No/Rollback) > \r\n");
+
+    while(1) {
+        uint8_t rx;
+        if(HAL_UART_Receive(&huart1, &rx, 1, HAL_MAX_DELAY) == HAL_OK) {
+            
+            /* --- EVET: Config Güncelle ve Resetle --- */
+            if(rx == 'e' || rx == 'E') {
+                Update_Config_And_Reset(new_ver);
+                break;
+            }
+            
+            /* --- HAYIR: Rollback Yap (B -> A) --- */
+            if(rx == 'h' || rx == 'H') {
+                printf(CLR_RED "\r\n[CANCEL] Update rejected.\r\n" CLR_RESET);
+                
+                /* Kullanıcı yeni yüklenen A'yı istemedi. 
+                 * A'yı silip, B'deki eski yedeği geri getiriyoruz. 
+                 */
+                Perform_Rollback_B_to_A();
+                
+                printf(CLR_YELLOW "System remains at v%lu.%lu.%lu. Resetting...\r\n" CLR_RESET,
+                        (old_ver>>16)&0xFF, (old_ver>>8)&0xFF, old_ver&0xFF);
+                HAL_Delay(1000);
+                HAL_NVIC_SystemReset();
+                break;
+            }
+        }
+    }
+}
+
