@@ -1,8 +1,11 @@
-/* main_blinky.c veya main.c */
+/* main_blinky.c */
 #include <stdio.h>
 #include "FreeRTOS.h"
 #include "task.h"
-#include "apex_services.h" /* Senin dosyanın yeni adı */
+#include "apex_services.h" /* Senin dosyanın adı */
+
+/* Linker hatasını çözmek için gerekli boş fonksiyon */
+void vBlinkyKeyboardInterruptHandler( void ) {}
 
 /* Test Görevi */
 void MyApexTask(void) {
@@ -13,16 +16,18 @@ void MyApexTask(void) {
         /* APEX servisini test et */
         GET_PARTITION_STATUS(&status, &ret);
         
-        /* NO_ERROR sildiğin için 0 kontrolü yapıyoruz (Enum varsayılanı 0'dır) */
+        /* NO_ERROR 0 olduğu için kontrol */
         if (ret == 0) { 
-            printf("APEX Calisiyor! Partition Period: %d ms\n", status.PERIOD);
+            /* %d yerine %ld kullandık çünkü APEX_INTEGER long tipinde */
+            printf("APEX Calisiyor! Partition Period: %ld ms\n", status.PERIOD);
         }
         
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
-int main(void) {
+/* DİKKAT: Burası artık "main" değil "main_blinky" */
+void main_blinky(void) {
     PROCESS_ATTRIBUTE_TYPE attr;
     PROCESS_ID_TYPE process_id;
     RETURN_CODE_TYPE ret;
@@ -31,6 +36,8 @@ int main(void) {
     attr.ENTRY_POINT = MyApexTask;
     attr.STACK_SIZE = configMINIMAL_STACK_SIZE;
     attr.BASE_PRIORITY = 1;
+    
+    /* sprintf_s güvenli versiyonu kullanıldı */
     sprintf_s(attr.NAME, 32, "TestProc");
 
     printf("Sistem Baslatiliyor...\n");
@@ -46,6 +53,4 @@ int main(void) {
     } else {
         printf("HATA: Process olusturulamadi! Kod: %d\n", ret);
     }
-
-    return 0;
 }
