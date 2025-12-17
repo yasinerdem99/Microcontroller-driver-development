@@ -1,57 +1,51 @@
-/* apex_services.c - Hata Giderilmiş Versiyon */
-#include "apex_types.h"
-#include <string.h>
+/* main_blinky.c veya main.c */
+#include <stdio.h>
+#include "FreeRTOS.h"
+#include "task.h"
+#include "apex_services.h" /* Senin dosyanın yeni adı */
 
-/* Mock Data */
-static PARTITION_STATUS_TYPE GlobalConfig = {
-    5000,    /* PERIOD */
-    1000,    /* DURATION */
-    0,       /* LOCK_LEVEL */
-    2        /* NUM_PROCESSES */
-};
+/* Test Görevi */
+void MyApexTask(void) {
+    PARTITION_STATUS_TYPE status;
+    RETURN_CODE_TYPE ret;
 
-void GET_PARTITION_STATUS(PARTITION_STATUS_TYPE *STATUS, RETURN_CODE_TYPE *RETURN_CODE) {
-    if (STATUS == NULL) {
-        *RETURN_CODE = INVALID_PARAM;
-        return;
+    for (;;) {
+        /* APEX servisini test et */
+        GET_PARTITION_STATUS(&status, &ret);
+        
+        /* NO_ERROR sildiğin için 0 kontrolü yapıyoruz (Enum varsayılanı 0'dır) */
+        if (ret == 0) { 
+            printf("APEX Calisiyor! Partition Period: %d ms\n", status.PERIOD);
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
-    *STATUS = GlobalConfig; 
-    *RETURN_CODE = NO_ERROR;
 }
 
-void CREATE_PROCESS(PROCESS_ATTRIBUTE_TYPE *ATTRIBUTES, PROCESS_ID_TYPE *PROCESS_ID, RETURN_CODE_TYPE *RETURN_CODE) {
-    BaseType_t xReturned;
+int main(void) {
+    PROCESS_ATTRIBUTE_TYPE attr;
+    PROCESS_ID_TYPE process_id;
+    RETURN_CODE_TYPE ret;
 
-    if (ATTRIBUTES == NULL || PROCESS_ID == NULL) {
-        *RETURN_CODE = INVALID_PARAM;
-        return;
-    }
+    /* Process özelliklerini hazırla */
+    attr.ENTRY_POINT = MyApexTask;
+    attr.STACK_SIZE = configMINIMAL_STACK_SIZE;
+    attr.BASE_PRIORITY = 1;
+    sprintf_s(attr.NAME, 32, "TestProc");
 
-    /* TaskHandle_t cast işlemi C++ derleyicileri için önemlidir */
-    xReturned = xTaskCreate(
-        (TaskFunction_t)ATTRIBUTES->ENTRY_POINT,
-        ATTRIBUTES->NAME,
-        (uint16_t)ATTRIBUTES->STACK_SIZE,
-        NULL,
-        (UBaseType_t)ATTRIBUTES->BASE_PRIORITY,
-        (TaskHandle_t *)PROCESS_ID 
-    );
+    printf("Sistem Baslatiliyor...\n");
 
-    if (xReturned == pdPASS) {
-        *RETURN_CODE = NO_ERROR;
+    /* --- APEX CREATE_PROCESS Kullanımı --- */
+    CREATE_PROCESS(&attr, &process_id, &ret);
+
+    if (ret == 0) {
+        printf("Process Olusturuldu. ID: %p\n", process_id);
+        
+        /* Scheduler Başlat */
+        vTaskStartScheduler();
     } else {
-        *RETURN_CODE = INVALID_CONFIG;
-    }
-}
-
-void SET_PRIORITY(PROCESS_ID_TYPE PROCESS_ID, PRIORITY_TYPE PRIORITY, RETURN_CODE_TYPE *RETURN_CODE) {
-    if (PROCESS_ID == NULL) {
-        *RETURN_CODE = INVALID_PARAM;
-        return;
+        printf("HATA: Process olusturulamadi! Kod: %d\n", ret);
     }
 
-    /* FreeRTOS fonksiyonu */
-    vTaskPrioritySet((TaskHandle_t)PROCESS_ID, (UBaseType_t)PRIORITY);
-
-    *RETURN_CODE = NO_ERROR;
+    return 0;
 }
