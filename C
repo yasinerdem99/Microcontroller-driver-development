@@ -1,67 +1,57 @@
-/* apex_types.h - Temiz Versiyon */
-#ifndef APEX_TYPES_H
-#define APEX_TYPES_H
+/* apex_services.c - Hata Giderilmiş Versiyon */
+#include "apex_types.h"
+#include <string.h>
 
-/* Önce FreeRTOS.h eklenmeli, YOKSA HATA VERİR */
-#include "FreeRTOS.h"
-#include "task.h"
+/* Mock Data */
+static PARTITION_STATUS_TYPE GlobalConfig = {
+    5000,    /* PERIOD */
+    1000,    /* DURATION */
+    0,       /* LOCK_LEVEL */
+    2        /* NUM_PROCESSES */
+};
 
-/* --- Temel Tipler --- */
-typedef char             APEX_BYTE;
-typedef long             APEX_INTEGER;
-typedef unsigned long    APEX_UNSIGNED;
-typedef long long        APEX_LONG_INTEGER;
-
-/* Eğer TaskHandle_t tanınmıyorsa, void* kullanalım (Generic çözüm) */
-#ifdef taskH
-    typedef TaskHandle_t PROCESS_ID_TYPE;
-#else
-    typedef void* PROCESS_ID_TYPE;
-#endif
-
-typedef APEX_INTEGER     PRIORITY_TYPE;
-
-/* --- Dönüş Kodları --- */
-typedef enum {
-    NO_ERROR = 0,
-    NO_ACTION,
-    NOT_AVAILABLE,
-    INVALID_PARAM,
-    INVALID_CONFIG,
-    INVALID_MODE,
-    TIMED_OUT
-} RETURN_CODE_TYPE;
-
-/* --- Yapılar --- */
-typedef struct {
-    APEX_LONG_INTEGER    PERIOD;
-    APEX_LONG_INTEGER    DURATION;
-    APEX_INTEGER         LOCK_LEVEL;
-    APEX_INTEGER         NUM_PROCESSES;
-} PARTITION_STATUS_TYPE;
-
-typedef struct {
-    char                 NAME[32];
-    void(*ENTRY_POINT)(void); 
-    APEX_INTEGER         STACK_SIZE;
-    PRIORITY_TYPE        BASE_PRIORITY;
-    APEX_LONG_INTEGER    PERIOD;
-    APEX_LONG_INTEGER    TIME_CAPACITY;
-    APEX_INTEGER         DEADLINE;
-} PROCESS_ATTRIBUTE_TYPE;
-
-/* --- Fonksiyonlar --- */
-/* C++ derleyicisi (Visual Studio) için "extern C" bloğu gerekebilir */
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-void GET_PARTITION_STATUS(PARTITION_STATUS_TYPE *STATUS, RETURN_CODE_TYPE *RETURN_CODE);
-void CREATE_PROCESS(PROCESS_ATTRIBUTE_TYPE *ATTRIBUTES, PROCESS_ID_TYPE *PROCESS_ID, RETURN_CODE_TYPE *RETURN_CODE);
-void SET_PRIORITY(PROCESS_ID_TYPE PROCESS_ID, PRIORITY_TYPE PRIORITY, RETURN_CODE_TYPE *RETURN_CODE);
-
-#ifdef __cplusplus
+void GET_PARTITION_STATUS(PARTITION_STATUS_TYPE *STATUS, RETURN_CODE_TYPE *RETURN_CODE) {
+    if (STATUS == NULL) {
+        *RETURN_CODE = INVALID_PARAM;
+        return;
+    }
+    *STATUS = GlobalConfig; 
+    *RETURN_CODE = NO_ERROR;
 }
-#endif
 
-#endif /* APEX_TYPES_H */
+void CREATE_PROCESS(PROCESS_ATTRIBUTE_TYPE *ATTRIBUTES, PROCESS_ID_TYPE *PROCESS_ID, RETURN_CODE_TYPE *RETURN_CODE) {
+    BaseType_t xReturned;
+
+    if (ATTRIBUTES == NULL || PROCESS_ID == NULL) {
+        *RETURN_CODE = INVALID_PARAM;
+        return;
+    }
+
+    /* TaskHandle_t cast işlemi C++ derleyicileri için önemlidir */
+    xReturned = xTaskCreate(
+        (TaskFunction_t)ATTRIBUTES->ENTRY_POINT,
+        ATTRIBUTES->NAME,
+        (uint16_t)ATTRIBUTES->STACK_SIZE,
+        NULL,
+        (UBaseType_t)ATTRIBUTES->BASE_PRIORITY,
+        (TaskHandle_t *)PROCESS_ID 
+    );
+
+    if (xReturned == pdPASS) {
+        *RETURN_CODE = NO_ERROR;
+    } else {
+        *RETURN_CODE = INVALID_CONFIG;
+    }
+}
+
+void SET_PRIORITY(PROCESS_ID_TYPE PROCESS_ID, PRIORITY_TYPE PRIORITY, RETURN_CODE_TYPE *RETURN_CODE) {
+    if (PROCESS_ID == NULL) {
+        *RETURN_CODE = INVALID_PARAM;
+        return;
+    }
+
+    /* FreeRTOS fonksiyonu */
+    vTaskPrioritySet((TaskHandle_t)PROCESS_ID, (UBaseType_t)PRIORITY);
+
+    *RETURN_CODE = NO_ERROR;
+}
