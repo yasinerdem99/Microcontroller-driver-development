@@ -1,56 +1,25 @@
-/* main_blinky.c */
-#include <stdio.h>
-#include "FreeRTOS.h"
-#include "task.h"
-#include "apex_services.h" /* Senin dosyanın adı */
+#include <stdint.h>
 
-/* Linker hatasını çözmek için gerekli boş fonksiyon */
-void vBlinkyKeyboardInterruptHandler( void ) {}
+/* Derleyici Makroları */
+#if defined ( __GNUC__ )
+  #define __SECTION(x) __attribute__((section(x)))
+#else
+  #define __SECTION(x)
+#endif
 
-/* Test Görevi */
-void MyApexTask(void) {
-    PARTITION_STATUS_TYPE status;
-    RETURN_CODE_TYPE ret;
+typedef struct {
+    uint32_t Version;       // Örn: 0x00010002 -> v1.0.2
+    uint32_t CRC_Placeholder; 
+    char     Build_Date[12];  // "Dec 13 2025"
+    char     Build_Time[9];   // "12:30:00"
+    char     Description[32];
+} App_Header_t;
 
-    for (;;) {
-        /* APEX servisini test et */
-        GET_PARTITION_STATUS(&status, &ret);
-        
-        /* NO_ERROR 0 olduğu için kontrol */
-        if (ret == 0) { 
-            /* %d yerine %ld kullandık çünkü APEX_INTEGER long tipinde */
-            printf("APEX Calisiyor! Partition Period: %ld ms\n", status.PERIOD);
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-}
-
-/* DİKKAT: Burası artık "main" değil "main_blinky" */
-void main_blinky(void) {
-    PROCESS_ATTRIBUTE_TYPE attr;
-    PROCESS_ID_TYPE process_id;
-    RETURN_CODE_TYPE ret;
-
-    /* Process özelliklerini hazırla */
-    attr.ENTRY_POINT = MyApexTask;
-    attr.STACK_SIZE = configMINIMAL_STACK_SIZE;
-    attr.BASE_PRIORITY = 1;
-    
-    /* sprintf_s güvenli versiyonu kullanıldı */
-    sprintf_s(attr.NAME, 32, "TestProc");
-
-    printf("Sistem Baslatiliyor...\n");
-
-    /* --- APEX CREATE_PROCESS Kullanımı --- */
-    CREATE_PROCESS(&attr, &process_id, &ret);
-
-    if (ret == 0) {
-        printf("Process Olusturuldu. ID: %p\n", process_id);
-        
-        /* Scheduler Başlat */
-        vTaskStartScheduler();
-    } else {
-        printf("HATA: Process olusturulamadi! Kod: %d\n", ret);
-    }
-}
+/* Header'ı .app_version bölümüne yerleştiriyoruz (0x400 Offset) */
+const App_Header_t __SECTION(".app_version") __attribute__((used)) App_Header = {
+    .Version = 0x00011116,
+    .CRC_Placeholder = 0x00000000,
+    .Build_Date = __DATE__,  // Derleyici  otomatik doldurur
+    .Build_Time = __TIME__,  // Derleyici  otomatik doldurur
+    .Description = "Main App"
+};
