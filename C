@@ -1,35 +1,94 @@
-/* Yardımcı Fonksiyon: Karakterlerin okunabilir olup olmadığını kontrol eder */
-int Is_Valid_String(const char *str, int max_len) {
-    for (int i = 0; i < max_len; i++) {
-        // Eğer string bitişine geldiysek geçerlidir
-        if (str[i] == 0) return 1; 
+# STM32U5 Dual-Bank Secure Bootloader
 
-        // Eğer karakter harf, sayı veya noktalama işareti DEĞİLSE, bu bir makine kodudur
-        if (str[i] < 32 || str[i] > 126) return 0; 
-    }
-    return 0; // Çok uzun süre null gelmediyse geçersiz say
-}
+Bu proje, **STM32U5** serisi mikrodenetleyiciler için geliştirilmiş, yedekli (redundant) yapıya sahip, sürüm kontrollü ve çoklu protokol destekli bir Bootloader yazılımıdır.
 
-/* ... KODUNUN DEVAMI ... */
+![Sistem Şeması](assets/system_architecture.png)
+*(Not: Projenize ait mimari görseli `assets` klasörüne ekleyip buradaki yolu güncelleyiniz.)*
 
-/* 6. ANALİZ VE KARAR AŞAMASI İÇİNDEKİ DEĞİŞİKLİK */
+## 📂 Proje Dosya Yapısı
 
-    App_Header_t *pNewHead = (App_Header_t*)(SLOT_A_ADDR + 0x400);
-    uint32_t new_ver = pNewHead->Version;
+Sistemin düzgün çalışması için dosya isimlendirmeleri ve yapısı kritiktir:
 
-    printf("\r\n\r\n=== DOĞRULAMA VE VERSİYON KONTROLÜ ===\r\n");
+* **`mcu_boot_u5_bootloader`**: Bootloader ana yazılımı (Maksimum 64KB).
+* **`mcu_boot_u5_application`**: Kullanıcı uygulama yazılımı.
 
-    /* KONTROLLÜ YAZDIRMA */
-    /* Build_Date normalde "Dec 13 2025" gibi görünür. Eğer ilk 12 karakterde saçma semboller varsa basma! */
-    if (Is_Valid_String(pNewHead->Build_Date, 12) && Is_Valid_String(pNewHead->Build_Time, 9)) {
-        printf(CLR_CYAN "Derleme Zamani: %.12s %.9s\r\n" CLR_RESET, pNewHead->Build_Date, pNewHead->Build_Time);
-        printf(CLR_CYAN "Aciklama      : %.32s\r\n" CLR_RESET, pNewHead->Description);
-    } else {
-        printf(CLR_YELLOW "[BILGI] Bu bir RAW Binary dosyasidir (Header Bilgisi Yok).\r\n" CLR_RESET);
-        // Yazı olmadığı için versiyonu da geçersiz sayabiliriz veya manuel 0 yapabiliriz
-        if (new_ver > 0xFFFF0000) { // Genellikle makine kodları büyük sayılar oluşturur
-             new_ver = 0; 
-        }
-    }
+---
 
-    /* ... Kalan kodlar ... */
+## 🚀 Özellikler
+
+* **İşlemci:** STM32U5 Serisi
+* **Çift Banka (Dual Bank) Desteği:** Slot A (Active) ve Slot B (Backup) yapısı sayesinde güvenli güncelleme.
+* **Sürüm ve Tarih Kontrolü:** Uygulama içerisindeki özel metadataları okuyarak versiyonun yükseltilip yükseltilmediğini denetler (Anti-rollback/Version Check).
+* **Adres Doğrulama:** Yükleme sırasında hedef adresin geçerliliğini kontrol eder; yanlış adreslere yazmayı engeller.
+* **Boyut:** 64 KB Bootloader alanı.
+* **Protokol Desteği:** XMODEM ve RAW (Sürükle-Bırak) transfer modları.
+* **Format Desteği:** Hem `.hex` hem de `.bin` dosya formatlarını destekler.
+
+---
+
+## 💾 Bellek Haritası (Memory Map)
+
+Yazılım aşağıdaki Flash bellek düzenine göre çalışır:
+
+| Bölge | Başlangıç Adresi | Açıklama |
+| :--- | :--- | :--- |
+| **Bootloader** | `0x0800 0000` | Başlangıç kodu (64KB Limit) |
+| **Flash Slot A** | `0x0801 0000` | Aktif Uygulama Alanı |
+| **Flash Slot B** | `0x0820 0000` | Yedek (Backup) Uygulama Alanı |
+
+---
+
+## 💻 CLI Komutları (Komut Satırı Arayüzü)
+
+Terminal üzerinden aşağıdaki komutlar kullanılabilir:
+
+| Komut | Açıklama |
+| :--- | :--- |
+| `help` | Kullanılabilir komutları ve yardım menüsünü listeler. |
+| `rbt` | Cihaza reset atar (Reboot). |
+| `clr` | Terminal ekranını veya hata bayraklarını temizler. |
+| `fwupdate` | Firmware güncelleme modunu başlatır. |
+
+---
+
+## 🔄 Firmware Güncelleme Yöntemleri
+
+Sistem 4 farklı transfer kombinasyonunu destekler. **Lütfen kullandığınız yönteme uygun prosedürü takip ediniz.**
+
+### 1. XMODEM Protokolü ile Yükleme
+Bu modda **Tera Term** veya XMODEM destekleyen bir terminal kullanılması zorunludur.
+
+* **Komutlar:**
+    * HEX dosyası için: `fwupdate hex -x`
+    * BIN dosyası için: `fwupdate bin -x`
+* **Nasıl Yapılır?**
+    1.  Komutu girin.
+    2.  Tera Term menüsünden **File > Transfer > XMODEM > Send...** yolunu izleyin.
+    3.  Yüklenecek dosyayı seçin.
+
+### 2. RAW (Sürükle-Bırak) Modu ile Yükleme
+Bu mod, dosya içeriğinin ham (raw) veri akışı veya sanal disk yöntemiyle aktarıldığı durumlar içindir.
+
+* **Komutlar:**
+    * HEX dosyası için: `fwupdate hex -r`
+    * BIN dosyası için: `fwupdate bin -r`
+* **Nasıl Yapılır?**
+    1.  Komutu girin.
+    2.  Dosyayı ilgili alana sürükleyip bırakın (veya raw data transferini başlatın).
+
+---
+
+## ⚠️ Kritik Uyarılar ve Sorun Giderme
+
+> **DİKKAT:** Transfer modlarını asla karıştırmayınız!
+> * XMODEM komutu (`-x`) verdiyseniz **asla** sürükle-bırak yapmayın.
+> * RAW komutu (`-r`) verdiyseniz **asla** XMODEM göndermeyin.
+
+**Sorun Giderme:**
+* Eğer yükleme sırasında sistem donarsa veya yanıt vermezse (Tıkanma Durumu), işlemciye donanımsal **RESET** atınız. Sistem kendini toparlayacaktır.
+* Versiyon hatası alıyorsanız, yüklemeye çalıştığınız yazılımın versiyonunun mevcut yazılımdan yüksek veya farklı olduğundan emin olun.
+
+---
+
+### Geliştirici
+**Yasin Erdem**
